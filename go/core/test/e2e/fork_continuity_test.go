@@ -4,7 +4,6 @@
 package e2e_test
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -18,19 +17,6 @@ import (
 	adka2a "github.com/kagent-dev/kagent/go/adk/pkg/a2a"
 	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
 )
-
-// checkpointForksSupported is false while Substrate 0.5 snapshots carry process
-// memory: kagent rejects forking them because the restored processes would keep
-// the source session's IDs. Remove it, and the guards that read it, once
-// lifecycle v2 lets templates take DATA snapshots on suspend again.
-const checkpointForksSupported = false
-
-// requireForkRejected asserts the rejection checkpointForksSupported describes.
-func requireForkRejected(ctx context.Context, t *testing.T, checkpoints apiv1alpha1.CheckpointServiceClient, checkpointID string) {
-	t.Helper()
-	_, err := checkpoints.ForkSession(ctx, &apiv1alpha1.ForkSessionRequest{CheckpointId: checkpointID, RequestId: uuid.NewString()})
-	require.Equal(t, codes.FailedPrecondition, status.Code(err), "fork a process-memory checkpoint: %v", err)
-}
 
 func TestSessionPausedTaskCheckpointRejected(t *testing.T) {
 	t.Parallel()
