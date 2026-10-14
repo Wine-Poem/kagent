@@ -72,7 +72,7 @@ func (c *Compiler) Compile(ctx context.Context, input *translator.HarnessInput) 
 	if err != nil {
 		return nil, err
 	}
-	skillResources, skillEgress, err := translator.CompileSkillResources(input.Root.Template)
+	skills, err := translator.CompileSkillResources(input.Root.Template)
 	if err != nil {
 		return nil, err
 	}
@@ -108,8 +108,8 @@ func (c *Compiler) Compile(ctx context.Context, input *translator.HarnessInput) 
 			cfg.Telemetry.Logs = &codexconfig.OTLPExporter{Endpoint: logConfig.Endpoint, Protocol: logConfig.Protocol}
 		}
 	}
-	if len(skillResources.Skills) != 0 || len(skillResources.Plugins) != 0 {
-		cfg.SkillResources = &skillResources
+	if len(skills.Resources.Skills) != 0 || len(skills.Resources.Plugins) != 0 {
+		cfg.SkillResources = &skills.Resources
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, translator.NewValidationError("invalid compiled Codex configuration: %v", err)
@@ -130,7 +130,7 @@ func (c *Compiler) Compile(ctx context.Context, input *translator.HarnessInput) 
 	if err != nil {
 		return nil, err
 	}
-	egress = append(egress, skillEgress...)
+	egress = append(egress, skills.Egress...)
 	egress = append(egress, mcp.egress...)
 	egress = append(egress, telemetryConfig.Destinations(environment)...)
 	egress = append(egress, c.settings.APIURL)
@@ -138,8 +138,9 @@ func (c *Compiler) Compile(ctx context.Context, input *translator.HarnessInput) 
 	egress = slices.Compact(egress)
 	return &translator.CompileResult{
 		Revision: translator.Revision{
-			Namespace: template.Namespace,
-			Image:     harness.Spec.Workload.Image, Environment: environment, ConfigJSON: configJSON, AgentCard: card,
+			Namespace:   template.Namespace,
+			SkillImages: skills.Images,
+			Image:       harness.Spec.Workload.Image, Environment: environment, ConfigJSON: configJSON, AgentCard: card,
 			WorkerPoolName: harness.Spec.Substrate.WorkerPoolRef.Name, SnapshotLocation: harness.Spec.Substrate.SnapshotPolicy.Location,
 			Credentials: credentials, Provenance: provenance, EgressDestinations: egress,
 		},
