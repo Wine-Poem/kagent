@@ -1,0 +1,27 @@
+providers: null
+podLabels:
+  compute-type: fargate
+config:
+  substrate:
+    apiEndpoint: dns:///api.ate-system.svc:443
+    routerUrl: http://atenet-router.ate-system.svc:80
+    caFile: /etc/ate-shim-ca/ca.crt
+substrateWorkerPool:
+  create: true
+  name: kagent-default
+  workerImage: unused-placeholder
+  sandboxClass: gvisor
+controller:
+  volumes:
+  - name: ate-shim-ca
+    secret: {secretName: ate-shim-ca}
+  volumeMounts:
+  - name: ate-shim-ca
+    mountPath: /etc/ate-shim-ca
+    readOnly: true
+kmcp:
+  enabled: false
+kagent-tools:
+  enabled: false
+grafana-mcp:
+  enabled: false

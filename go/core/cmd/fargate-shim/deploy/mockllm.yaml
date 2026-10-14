@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: mockllm, namespace: kagent}
+data:
+  config.json: |
+    {
+      "listen_addr": "0.0.0.0:8080",
+      "openai": [
+        {"name": "probe", "match": {"match_type": "contains", "message": {"role": "user", "content": "Fargate probe"}},
+         "response": {"id": "chatcmpl-1", "object": "chat.completion", "created": 1677652288, "model": "mock-model",
+           "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello from a Fargate microVM session pod."}, "finish_reason": "stop"}]}},
+        {"name": "catch-all", "match": {"match_type": "contains", "message": {"role": "user", "content": ""}},
+         "response": {"id": "chatcmpl-2", "object": "chat.completion", "created": 1677652288, "model": "mock-model",
+           "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]}}
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: mockllm, namespace: kagent, labels: {app: mockllm}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: mockllm}}
+  template:
+    metadata:
+      labels: {app: mockllm, compute-type: fargate}
+    spec:
+      containers:
+      - name: mockllm
+        image: <registry>/kagent-fargate-probe:<tag>
+        command: ["/mockllm", "-config", "/etc/mockllm/config.json"]
+        ports: [{containerPort: 8080}]
+        readinessProbe: {tcpSocket: {port: 8080}, periodSeconds: 3}
+        resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: 250m, memory: 512Mi}}
+        volumeMounts: [{name: cfg, mountPath: /etc/mockllm}]
+      volumes: [{name: cfg, configMap: {name: mockllm}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: mockllm, namespace: kagent}
+spec:
+  selector: {app: mockllm}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: mock-openai, namespace: kagent}
+stringData: {OPENAI_API_KEY: mock-key}
