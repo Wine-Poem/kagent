@@ -70,6 +70,7 @@ import (
 	"github.com/kagent-dev/kagent/go/core/internal/version"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 	"github.com/kagent-dev/kagent/go/core/pkg/config"
+	"github.com/kagent-dev/kagent/go/core/pkg/egressext"
 	"github.com/kagent-dev/kagent/go/core/pkg/migrations"
 	"github.com/kagent-dev/kagent/go/pkg/logging"
 	"github.com/kagent-dev/kagent/go/pkg/telemetry"
@@ -84,6 +85,9 @@ import (
 // every service that takes one — so a library consumer cannot narrow where
 // its own policy applies.
 type Options struct {
+	// EgressCredentialBinder tells the egress gateway which credentials to inject
+	// into an Agent's outbound requests. Nil adds none.
+	EgressCredentialBinder egressext.CredentialBinder
 	// Authenticator identifies the caller. Nil selects InsecureAuthenticator,
 	// which admits every request.
 	Authenticator auth.AuthProvider
@@ -182,6 +186,7 @@ func Run(ctx context.Context, input *apiv1.ControllerConfig, opts Options) error
 	if err != nil {
 		return err
 	}
+	compilerSettings.EgressCredentialBinder = opts.EgressCredentialBinder
 	telemetryOptions := telemetry.Options{Config: config.Telemetry(cfg.GetTelemetry()), Defaults: []attribute.KeyValue{
 		semconv.ServiceName("kagent-controller"), semconv.ServiceNamespace("kagent"), semconv.ServiceVersion(version.Version),
 	}}

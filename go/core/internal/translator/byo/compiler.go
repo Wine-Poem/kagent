@@ -36,10 +36,7 @@ func (c *Compiler) Compile(ctx context.Context, input *translator.HarnessInput) 
 	}
 	template, harness := input.Root.Template, input.Harness
 	compiled.Config.Runtime = c.settings.RuntimeConfig(input.AgentName, template.Namespace)
-	configJSON, err := json.Marshal(compiled.Config)
-	if err != nil {
-		return nil, fmt.Errorf("marshal agent config: %w", err)
-	}
+
 	card, err := pbconv.ToProtoAgentCard(agentTemplateCard(input.AgentName, template))
 	if err != nil {
 		return nil, fmt.Errorf("convert agent card: %w", err)
@@ -58,9 +55,17 @@ func (c *Compiler) Compile(ctx context.Context, input *translator.HarnessInput) 
 	if err != nil {
 		return nil, fmt.Errorf("build revision provenance: %w", err)
 	}
-	environment, credentials, err := translator.CompileCredentials(input, compiled.Models, environment)
+	environment, credentials, additions, err := translator.CompileCredentials(input, compiled.Models, environment, c.settings.EgressCredentialBinder)
 	if err != nil {
 		return nil, err
+	}
+	if err := adkconfig.ApplyCredentialHeaders(compiled.Config, additions); err != nil {
+		return nil, err
+	}
+
+	configJSON, err := json.Marshal(compiled.Config)
+	if err != nil {
+		return nil, fmt.Errorf("marshal agent config: %w", err)
 	}
 	compiled.Egress = append(compiled.Egress, telemetryConfig.Destinations(environment)...)
 	compiled.Egress = append(compiled.Egress, c.settings.APIURL)

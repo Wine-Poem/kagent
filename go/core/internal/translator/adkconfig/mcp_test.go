@@ -7,6 +7,8 @@ import (
 
 	"github.com/kagent-dev/kagent/go/api/adk"
 	"github.com/kagent-dev/kagent/go/api/v1alpha3"
+	"github.com/kagent-dev/kagent/go/core/internal/egress"
+	"github.com/kagent-dev/kagent/go/core/internal/translator"
 )
 
 func TestAddRemoteMCPServerPreservesBindingApproval(t *testing.T) {
@@ -51,4 +53,17 @@ func TestAddRemoteMCPServerPreservesBindingApproval(t *testing.T) {
 			test.assert(t, config)
 		})
 	}
+}
+
+func TestApplyCredentialHeadersToSharedAndSSEClients(t *testing.T) {
+	config := &adk.AgentConfig{
+		HttpTools: []adk.HttpMcpServerConfig{{Params: adk.StreamableHTTPConnectionParams{Url: "https://tools.example.com/http", Headers: map[string]string{"X-Trace": "keep"}}}},
+		SseTools:  []adk.SseMcpServerConfig{{Params: adk.SseConnectionParams{Url: "https://tools.example.com/sse"}}},
+		SubAgents: []*adk.AgentConfig{{HttpTools: []adk.HttpMcpServerConfig{{Params: adk.StreamableHTTPConnectionParams{Url: "https://tools.example.com/child"}}}}},
+	}
+	require.NoError(t, ApplyCredentialHeaders(config, []egress.Credential{{Origin: "https://tools.example.com:443", Header: "authorization", URI: "ate-secret://provider.example/token"}}))
+	require.Equal(t, "keep", config.HttpTools[0].Params.Headers["X-Trace"])
+	require.Equal(t, translator.CredentialPlaceholder, config.HttpTools[0].Params.Headers["authorization"])
+	require.Equal(t, translator.CredentialPlaceholder, config.SseTools[0].Params.Headers["authorization"])
+	require.Equal(t, translator.CredentialPlaceholder, config.SubAgents[0].HttpTools[0].Params.Headers["authorization"])
 }

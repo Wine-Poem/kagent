@@ -7,17 +7,19 @@ import (
 	"github.com/kagent-dev/kagent/go/api/adk"
 	apiv1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
 	"github.com/kagent-dev/kagent/go/core/pkg/config"
+	"github.com/kagent-dev/kagent/go/core/pkg/egressext"
 	"github.com/kagent-dev/kagent/go/pkg/tracing"
 )
 
 // CompilerSettings contains only deployment inputs needed by harness compilers.
 // It is resolved once at startup, independently of reconciliation and env.
 type CompilerSettings struct {
-	APIURL     string
-	GatewayURL string
-	LogLevel   string
-	Telemetry  TelemetryConfig
-	Process    adk.RuntimeConfig
+	EgressCredentialBinder egressext.CredentialBinder
+	APIURL                 string
+	GatewayURL             string
+	LogLevel               string
+	Telemetry              TelemetryConfig
+	Process                adk.RuntimeConfig
 }
 
 func NewCompilerSettings(cfg *apiv1.RuntimeDefaultsConfig) (CompilerSettings, error) {

@@ -111,13 +111,7 @@ func (c *Compiler) Compile(ctx context.Context, input *translator.HarnessInput) 
 	if len(skillResources.Skills) != 0 || len(skillResources.Plugins) != 0 {
 		cfg.SkillResources = &skillResources
 	}
-	if err := cfg.Validate(); err != nil {
-		return nil, translator.NewValidationError("invalid compiled Codex configuration: %v", err)
-	}
-	configJSON, err := json.Marshal(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("marshal Codex config: %w", err)
-	}
+
 	card, err := pbconv.ToProtoAgentCard(translator.ManagedAgentCard(input.AgentName, input.Root.Template))
 	if err != nil {
 		return nil, fmt.Errorf("convert Codex agent card: %w", err)
@@ -126,9 +120,24 @@ func (c *Compiler) Compile(ctx context.Context, input *translator.HarnessInput) 
 	if err != nil {
 		return nil, fmt.Errorf("build Codex revision provenance: %w", err)
 	}
-	environment, credentials, err := translator.CompileCredentials(input, nil, environment)
+	environment, credentials, additions, err := translator.CompileCredentials(input, nil, environment, c.settings.EgressCredentialBinder)
 	if err != nil {
 		return nil, err
+	}
+	for name, server := range cfg.MCPServers {
+		server.Headers, err = translator.CredentialHeaders(server.URL, server.Headers, additions)
+		if err != nil {
+			return nil, err
+		}
+		cfg.MCPServers[name] = server
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, translator.NewValidationError("invalid compiled Codex configuration: %v", err)
+	}
+
+	configJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("marshal Codex config: %w", err)
 	}
 	egress = append(egress, skillEgress...)
 	egress = append(egress, mcp.egress...)
@@ -159,8 +168,12 @@ func (c *Compiler) compileProvider(ctx context.Context, model *v1alpha3.ModelCon
 		if !reflect.DeepEqual(options, v1alpha3.OpenAIConfig{}) {
 			return codexconfig.Provider{}, nil, nil, translator.NewValidationError("Codex does not support OpenAI provider options beyond baseUrl and apiFormat responses")
 		}
-		if err := c.requireSecretKey(ctx, model.Namespace, model.Spec.APIKeySecret, model.Spec.APIKeySecretKey); err != nil {
-			return codexconfig.Provider{}, nil, nil, err
+		environment := []corev1.EnvVar{{Name: openAIAPIKeyEnv, Value: translator.CredentialPlaceholder}}
+		if model.Spec.APIKeySecret != "" || c.settings.EgressCredentialBinder == nil {
+			if err := c.requireSecretKey(ctx, model.Namespace, model.Spec.APIKeySecret, model.Spec.APIKeySecretKey); err != nil {
+				return codexconfig.Provider{}, nil, nil, err
+			}
+			environment[0] = secretEnvironment(openAIAPIKeyEnv, model.Spec.APIKeySecret, model.Spec.APIKeySecretKey)
 		}
 		provider := codexconfig.Provider{Name: "openai", BaseURL: baseURL}
 		egress := []string{"https://api.openai.com:443"}
@@ -171,7 +184,7 @@ func (c *Compiler) compileProvider(ctx context.Context, model *v1alpha3.ModelCon
 			}
 			egress = []string{host}
 		}
-		return provider, []corev1.EnvVar{secretEnvironment(openAIAPIKeyEnv, model.Spec.APIKeySecret, model.Spec.APIKeySecretKey)}, egress, nil
+		return provider, environment, egress, nil
 	case v1alpha3.ModelProviderBedrock:
 		if model.Spec.Bedrock == nil || strings.TrimSpace(model.Spec.Bedrock.Region) == "" {
 			return codexconfig.Provider{}, nil, nil, translator.NewValidationError("Codex Bedrock requires bedrock.region")
@@ -187,6 +200,12 @@ func (c *Compiler) compileProvider(ctx context.Context, model *v1alpha3.ModelCon
 		}
 		if !reflect.DeepEqual(options, v1alpha3.BedrockConfig{}) {
 			return codexconfig.Provider{}, nil, nil, translator.NewValidationError("Codex does not support Bedrock provider options beyond region")
+		}
+		if model.Spec.APIKeySecret == "" && c.settings.EgressCredentialBinder != nil {
+			return codexconfig.Provider{Name: "amazon-bedrock"}, []corev1.EnvVar{
+				{Name: awsRegionEnv, Value: region},
+				{Name: awsBedrockTokenEnv, Value: translator.CredentialPlaceholder},
+			}, []string{"https://bedrock-runtime." + region + ".amazonaws.com:443"}, nil
 		}
 		if model.Spec.APIKeySecret == "" || model.Spec.APIKeySecretKey != "" {
 			return codexconfig.Provider{}, nil, nil, translator.NewValidationError("Codex Bedrock requires apiKeySecret and an empty apiKeySecretKey")
