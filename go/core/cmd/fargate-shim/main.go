@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +36,14 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 {
+		subcommands := map[string]func([]string) error{
+			"wrapper": runWrapper, "install": runInstall, "restore": runRestore, "sidecar": runSidecar, "store": runStore,
+		}
+		if sub, ok := subcommands[os.Args[1]]; ok {
+			return sub(os.Args[2:])
+		}
+	}
 	grpcAddr := flag.String("grpc-addr", ":8443", "TLS listen address of the ate-api compatible server")
 	routerAddr := flag.String("router-addr", ":8080", "listen address of the router (cleartext HTTP/2)")
 	certFile := flag.String("tls-cert", "/etc/ate-shim/tls.crt", "server certificate")
@@ -45,6 +54,12 @@ func run() error {
 	actorSA := flag.String("actor-service-account", "", "service account of actor pods")
 	runAsRoot := flag.Bool("actor-run-as-root", true, "run actor containers as root, like inside a Substrate sandbox")
 	grace := flag.Duration("suspend-grace", 10*time.Minute, "how long a suspended actor keeps its pod")
+	eager := flag.Bool("eager-start", true, "start an actor's pod when it is created instead of at the first request")
+	warmSize := flag.Int("warm-pool", 0, "idle warm pods kept per runtime image; 0 turns the pool off")
+	warmTTL := flag.Duration("warm-idle-ttl", 30*time.Minute, "drop a warm pool nobody has used for this long")
+	snapshotURL := flag.String("snapshot-url", "", "base URL of the snapshot store; empty keeps /data only for the life of the pod")
+	snapshotSecretFile := flag.String("snapshot-secret-file", "/etc/ate-snapshot/secret", "secret shared with the snapshot store")
+	helperImage := flag.String("helper-image", os.Getenv("HELPER_IMAGE"), "image of this program, used by restore, snapshot and warm pods")
 	flag.Parse()
 	if *namespace == "" {
 		return fmt.Errorf("--namespace or POD_NAMESPACE is required")
@@ -58,8 +73,27 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	srv := newServer(&k8sPods{client: client, settings: podSettings{CPU: *actorCPU, Memory: *actorMemory, ServiceAccount: *actorSA, RunAsRoot: *runAsRoot}},
-		stateSaver(client, *namespace), config{SuspendGrace: *grace, ResumeWait: 25 * time.Second, RouterWait: 150 * time.Second})
+	var store *snapshots
+	if *snapshotURL != "" {
+		secret, err := os.ReadFile(*snapshotSecretFile)
+		if err != nil {
+			return fmt.Errorf("read snapshot secret: %w", err)
+		}
+		store = &snapshots{baseURL: *snapshotURL, secret: []byte(strings.TrimSpace(string(secret)))}
+	}
+	pods := &k8sPods{client: client, settings: podSettings{
+		CPU: *actorCPU, Memory: *actorMemory, ServiceAccount: *actorSA, RunAsRoot: *runAsRoot,
+		HelperImage: *helperImage, Persistence: store.enabled(),
+	}}
+	if *warmSize > 0 {
+		if *helperImage == "" {
+			return fmt.Errorf("--warm-pool needs --helper-image: warm pods start the runtime through this program")
+		}
+		pods.warm = newWarmPool(*warmSize, *warmTTL)
+	}
+	srv := newServer(pods, stateSaver(client, *namespace), config{
+		SuspendGrace: *grace, ResumeWait: 25 * time.Second, RouterWait: 150 * time.Second, EagerStart: *eager, Snapshots: store,
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -67,6 +101,7 @@ func run() error {
 		if err := srv.load([]byte(cm.Data["state.json"])); err != nil {
 			return fmt.Errorf("load state: %w", err)
 		}
+		srv.hintExisting()
 		slog.Info("state restored", "actors", len(srv.actors), "templates", len(srv.templates))
 	} else if !apierrors.IsNotFound(err) {
 		return err
@@ -88,6 +123,7 @@ func run() error {
 	go func() { errs <- grpcServer.Serve(lis) }()
 	go func() { errs <- routerServer.ListenAndServe() }()
 	go srv.runReaper(ctx, 15*time.Second)
+	go srv.runMaintenance(ctx, 5*time.Second)
 	slog.Info("fargate-shim started", "grpc", *grpcAddr, "router", *routerAddr)
 
 	select {

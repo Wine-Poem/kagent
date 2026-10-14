@@ -8,7 +8,7 @@ metadata: {name: ate-fargate-shim}
 rules:
 - apiGroups: [""]
   resources: [pods]
-  verbs: [get, list, watch, create, delete]
+  verbs: [get, list, watch, create, patch, delete]
 - apiGroups: [""]
   resources: [configmaps]
   verbs: [get, create, update]
@@ -34,15 +34,27 @@ spec:
       containers:
       - name: shim
         image: <registry>/kagent-fargate-probe:<tag>
-        args: ["--suspend-grace=10m", "--actor-cpu=500m", "--actor-memory=1Gi"]
+        args:
+        - --suspend-grace=10m
+        - --actor-cpu=400m
+        - --actor-memory=1Gi
+        - --eager-start=true
+        - --warm-pool=1
+        - --snapshot-url=http://ate-snapshot-store.ate-system.svc:8080
         env:
         - name: POD_NAMESPACE
           valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+        - name: HELPER_IMAGE
+          value: <registry>/kagent-fargate-probe:<tag>
         ports: [{name: grpc, containerPort: 8443}, {name: router, containerPort: 8080}]
         readinessProbe: {tcpSocket: {port: 8443}, periodSeconds: 3}
         resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: 250m, memory: 512Mi}}
-        volumeMounts: [{name: tls, mountPath: /etc/ate-shim, readOnly: true}]
-      volumes: [{name: tls, secret: {secretName: ate-shim-tls}}]
+        volumeMounts:
+        - {name: tls, mountPath: /etc/ate-shim, readOnly: true}
+        - {name: snapshot-secret, mountPath: /etc/ate-snapshot, readOnly: true}
+      volumes:
+      - {name: tls, secret: {secretName: ate-shim-tls}}
+      - {name: snapshot-secret, secret: {secretName: ate-snapshot-secret}}
 ---
 apiVersion: v1
 kind: Service

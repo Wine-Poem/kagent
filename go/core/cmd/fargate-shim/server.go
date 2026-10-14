@@ -31,16 +31,24 @@ type podState struct {
 }
 
 type podManager interface {
-	Ensure(ctx context.Context, actor *ateapipb.Actor, template *ateapipb.ActorTemplate) error
-	State(ctx context.Context, atespace, name string) (podState, error)
-	Delete(ctx context.Context, atespace, name string) error
-	ListManaged(ctx context.Context) ([]ref, error)
+	// Start returns the name of the pod that serves the actor. That is a new pod named
+	// like the actor, or a warm pod the actor claimed.
+	Start(ctx context.Context, req startRequest) (string, error)
+	State(ctx context.Context, atespace, pod string) (podState, error)
+	Delete(ctx context.Context, atespace, pod string) error
+	List(ctx context.Context) ([]podInfo, error)
+	// Hint tells the warm pool that a template is in use; Maintain refills the pools.
+	Hint(template *ateapipb.ActorTemplate)
+	Maintain(ctx context.Context)
 }
 
 type config struct {
 	SuspendGrace time.Duration
 	ResumeWait   time.Duration
 	RouterWait   time.Duration
+	// EagerStart starts the pod when the actor is created instead of at the first request.
+	EagerStart bool
+	Snapshots  *snapshots
 }
 
 type actorRecord struct {
@@ -49,6 +57,17 @@ type actorRecord struct {
 	wanted      ateapipb.ActorState
 	snapshotN   int
 	suspendedAt time.Time
+	// podName is empty until a pod was started; a claimed warm pod keeps its own name.
+	podName string
+	// startMu serializes pod starts per actor, so an eager start and a resume cannot claim two warm pods.
+	startMu sync.Mutex
+}
+
+func (r *actorRecord) pod() string {
+	if r.podName != "" {
+		return r.podName
+	}
+	return r.actor.GetMetadata().GetName()
 }
 
 // server implements the subset of the ate-api Control service that kagent uses.
@@ -63,6 +82,7 @@ type server struct {
 	persist   func([]byte) error
 	cfg       config
 	now       func() time.Time
+	save      func(ctx context.Context, podIP string, ref snapshotRef) error
 }
 
 func newServer(pods podManager, persist func([]byte) error, cfg config) *server {
@@ -70,7 +90,7 @@ func newServer(pods podManager, persist func([]byte) error, cfg config) *server 
 		atespaces: map[string]*ateapipb.Atespace{},
 		templates: map[ref]*ateapipb.ActorTemplate{},
 		actors:    map[ref]*actorRecord{},
-		pods:      pods, persist: persist, cfg: cfg, now: time.Now,
+		pods:      pods, persist: persist, cfg: cfg, now: time.Now, save: requestSave,
 	}
 }
 
@@ -207,6 +227,10 @@ func (s *server) CreateActor(_ context.Context, req *ateapipb.CreateActorRequest
 	if err := s.saveLocked(); err != nil {
 		return nil, err
 	}
+	s.pods.Hint(template)
+	if s.cfg.EagerStart {
+		go s.eagerStart(key)
+	}
 	return s.viewLocked(context.Background(), rec), nil
 }
 
@@ -254,9 +278,14 @@ func (s *server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 }
 
 func (s *server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
+	key := refOf(req.GetActor())
+	// /data is saved before the state changes, so a failed save leaves the actor running and kagent retries.
+	if err := s.saveData(ctx, key); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok := s.actors[refOf(req.GetActor())]
+	rec, ok := s.actors[key]
 	if !ok {
 		return nil, status.Error(codes.NotFound, "actor not found")
 	}
@@ -287,11 +316,15 @@ func (s *server) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorReque
 		return nil, status.Error(codes.NotFound, "actor not found")
 	}
 	deleted := s.viewLocked(ctx, rec)
+	podName, uid := rec.pod(), rec.actor.GetMetadata().GetUid()
 	delete(s.actors, key)
 	err := s.saveLocked()
 	s.mu.Unlock()
-	if perr := s.pods.Delete(ctx, key.atespace, key.name); perr != nil {
+	if perr := s.pods.Delete(ctx, key.atespace, podName); perr != nil {
 		return nil, status.Errorf(codes.Internal, "delete pod: %v", perr)
+	}
+	if serr := s.cfg.Snapshots.delete(ctx, uid); serr != nil {
+		slog.Warn("delete snapshot", "actor", key.String(), "error", serr)
 	}
 	deleted.Status.State = ateapipb.ActorState_ACTOR_STATE_DELETING
 	return deleted, err
@@ -323,40 +356,82 @@ func (s *server) GetActorEgressPolicy(_ context.Context, req *ateapipb.GetActorE
 	return proto.Clone(rec.policy).(*ateapipb.EgressPolicy), nil
 }
 
-// ensureRunning starts the actor's pod when needed and waits until it is ready or
-// the timeout passes. The router calls it to resume suspended actors on demand.
-func (s *server) ensureRunning(ctx context.Context, key ref, wait time.Duration) (podState, error) {
+// startPod makes sure a pod exists for the actor and remembers its name. With run set it
+// also marks the actor RUNNING; the eager start at creation leaves the state alone.
+func (s *server) startPod(ctx context.Context, key ref, run bool) error {
 	s.mu.Lock()
 	rec, ok := s.actors[key]
 	if !ok {
 		s.mu.Unlock()
-		return podState{}, status.Error(codes.NotFound, "actor not found")
+		return status.Error(codes.NotFound, "actor not found")
 	}
 	template, ok := s.templates[refOf(rec.actor.GetActorTemplate())]
 	if !ok {
 		s.mu.Unlock()
-		return podState{}, status.Error(codes.FailedPrecondition, "actor template is gone")
+		return status.Error(codes.FailedPrecondition, "actor template is gone")
 	}
 	actor := proto.Clone(rec.actor).(*ateapipb.Actor)
 	template = proto.Clone(template).(*ateapipb.ActorTemplate)
-	if rec.wanted != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+	if run && rec.wanted != ateapipb.ActorState_ACTOR_STATE_RUNNING {
 		rec.wanted = ateapipb.ActorState_ACTOR_STATE_RUNNING
 		if err := s.saveLocked(); err != nil {
 			s.mu.Unlock()
-			return podState{}, err
+			return err
 		}
 	}
 	s.mu.Unlock()
 
-	if err := s.pods.Ensure(ctx, actor, template); err != nil {
-		return podState{}, status.Errorf(codes.Unavailable, "start pod: %v", err)
+	rec.startMu.Lock()
+	defer rec.startMu.Unlock()
+	s.mu.Lock()
+	podName := rec.pod()
+	s.mu.Unlock()
+	if state, err := s.pods.State(ctx, key.atespace, podName); err == nil && state.Exists {
+		return nil
+	}
+	name, err := s.pods.Start(ctx, startRequest{Actor: actor, Template: template, Snapshot: s.cfg.Snapshots.refFor(actor.GetMetadata().GetUid())})
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "start pod: %v", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.actors[key] == rec && rec.podName != name {
+		rec.podName = name
+		return s.saveLocked()
+	}
+	return nil
+}
+
+func (s *server) eagerStart(key ref) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := s.startPod(ctx, key, false); err != nil {
+		slog.Warn("eager start", "actor", key.String(), "error", err)
+	}
+}
+
+// ensureRunning starts the actor's pod when needed and waits until it is ready or
+// the timeout passes. The router calls it to resume suspended actors on demand.
+func (s *server) ensureRunning(ctx context.Context, key ref, wait time.Duration) (podState, error) {
+	if err := s.startPod(ctx, key, true); err != nil {
+		return podState{}, err
 	}
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
-		state, err := s.pods.State(ctx, key.atespace, key.name)
+		s.mu.Lock()
+		rec, ok := s.actors[key]
+		podName := ""
+		if ok {
+			podName = rec.pod()
+		}
+		s.mu.Unlock()
+		if !ok {
+			return podState{}, status.Error(codes.NotFound, "actor not found")
+		}
+		state, err := s.pods.State(ctx, key.atespace, podName)
 		if err == nil && state.Ready && state.IP != "" {
 			return state, nil
 		}
@@ -370,6 +445,31 @@ func (s *server) ensureRunning(ctx context.Context, key ref, wait time.Duration)
 	}
 }
 
+// saveData asks the actor's snapshot sidecar to upload /data. It does nothing without a
+// snapshot store or without a ready pod.
+func (s *server) saveData(ctx context.Context, key ref) error {
+	s.mu.Lock()
+	rec, ok := s.actors[key]
+	if !ok {
+		s.mu.Unlock()
+		return status.Error(codes.NotFound, "actor not found")
+	}
+	podName, uid := rec.pod(), rec.actor.GetMetadata().GetUid()
+	s.mu.Unlock()
+	snapshot := s.cfg.Snapshots.refFor(uid)
+	if snapshot == nil {
+		return nil
+	}
+	state, err := s.pods.State(ctx, key.atespace, podName)
+	if err != nil || !state.Ready || state.IP == "" {
+		return nil
+	}
+	if err := s.save(ctx, state.IP, *snapshot); err != nil {
+		return status.Errorf(codes.Unavailable, "save /data: %v", err)
+	}
+	return nil
+}
+
 func (s *server) viewLocked(ctx context.Context, rec *actorRecord) *ateapipb.Actor {
 	view := proto.Clone(rec.actor).(*ateapipb.Actor)
 	key := ref{rec.actor.GetMetadata().GetAtespace(), rec.actor.GetMetadata().GetName()}
@@ -377,7 +477,7 @@ func (s *server) viewLocked(ctx context.Context, rec *actorRecord) *ateapipb.Act
 	view.Status = &ateapipb.ActorStatus{}
 	switch rec.wanted {
 	case ateapipb.ActorState_ACTOR_STATE_RUNNING:
-		pod, err := s.pods.State(ctx, key.atespace, key.name)
+		pod, err := s.pods.State(ctx, key.atespace, rec.pod())
 		switch {
 		case err == nil && pod.Ready:
 			state = ateapipb.ActorState_ACTOR_STATE_RUNNING
@@ -404,32 +504,34 @@ func (s *server) viewLocked(ctx context.Context, rec *actorRecord) *ateapipb.Act
 }
 
 // reap deletes pods of suspended actors after the grace period and pods without an actor.
+// Warm pods belong to the pool, which manages them.
 func (s *server) reap(ctx context.Context) {
 	s.mu.Lock()
 	var expired []ref
-	known := map[ref]bool{}
+	inUse := map[ref]bool{}
 	for key, rec := range s.actors {
-		known[key] = true
+		pod := ref{key.atespace, rec.pod()}
+		inUse[pod] = true
 		if rec.wanted == ateapipb.ActorState_ACTOR_STATE_SUSPENDED && s.now().Sub(rec.suspendedAt) >= s.cfg.SuspendGrace {
-			expired = append(expired, key)
+			expired = append(expired, pod)
 		}
 	}
 	s.mu.Unlock()
-	managed, err := s.pods.ListManaged(ctx)
+	managed, err := s.pods.List(ctx)
 	if err != nil {
 		slog.Warn("list managed pods", "error", err)
 		return
 	}
-	for _, key := range managed {
-		if !known[key] {
-			expired = append(expired, key)
+	for _, m := range managed {
+		if m.warmKey == "" && !inUse[m.ref] {
+			expired = append(expired, m.ref)
 		}
 	}
-	for _, key := range expired {
-		if state, err := s.pods.State(ctx, key.atespace, key.name); err == nil && state.Exists {
-			slog.Info("deleting idle pod", "actor", key.String())
-			if err := s.pods.Delete(ctx, key.atespace, key.name); err != nil {
-				slog.Warn("delete idle pod", "actor", key.String(), "error", err)
+	for _, pod := range expired {
+		if state, err := s.pods.State(ctx, pod.atespace, pod.name); err == nil && state.Exists {
+			slog.Info("deleting idle pod", "pod", pod.String())
+			if err := s.pods.Delete(ctx, pod.atespace, pod.name); err != nil {
+				slog.Warn("delete idle pod", "pod", pod.String(), "error", err)
 			}
 		}
 	}
@@ -448,6 +550,30 @@ func (s *server) runReaper(ctx context.Context, every time.Duration) {
 	}
 }
 
+// hintExisting re-registers the templates of known actors with the warm pool after a restart.
+func (s *server) hintExisting() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, rec := range s.actors {
+		if template := s.templates[refOf(rec.actor.GetActorTemplate())]; template != nil {
+			s.pods.Hint(template)
+		}
+	}
+}
+
+func (s *server) runMaintenance(ctx context.Context, every time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.pods.Maintain(ctx)
+		}
+	}
+}
+
 type persisted struct {
 	Atespaces []string                `json:"atespaces"`
 	Templates map[string][]byte       `json:"templates"`
@@ -457,6 +583,7 @@ type persisted struct {
 type persistedRec struct {
 	Actor       []byte    `json:"actor"`
 	Policy      []byte    `json:"policy,omitempty"`
+	PodName     string    `json:"podName,omitempty"`
 	Wanted      int32     `json:"wanted"`
 	SnapshotN   int       `json:"snapshotN"`
 	SuspendedAt time.Time `json:"suspendedAt"`
@@ -482,7 +609,7 @@ func (s *server) saveLocked() error {
 		if err != nil {
 			return status.Errorf(codes.Internal, "marshal actor: %v", err)
 		}
-		out := persistedRec{Actor: raw, Wanted: int32(rec.wanted), SnapshotN: rec.snapshotN, SuspendedAt: rec.suspendedAt}
+		out := persistedRec{Actor: raw, PodName: rec.podName, Wanted: int32(rec.wanted), SnapshotN: rec.snapshotN, SuspendedAt: rec.suspendedAt}
 		if rec.policy != nil {
 			if out.Policy, err = proto.Marshal(rec.policy); err != nil {
 				return status.Errorf(codes.Internal, "marshal policy: %v", err)
@@ -522,7 +649,7 @@ func (s *server) load(raw []byte) error {
 		if err := proto.Unmarshal(p.Actor, actor); err != nil {
 			return err
 		}
-		rec := &actorRecord{actor: actor, wanted: ateapipb.ActorState(p.Wanted), snapshotN: p.SnapshotN, suspendedAt: p.SuspendedAt}
+		rec := &actorRecord{actor: actor, podName: p.PodName, wanted: ateapipb.ActorState(p.Wanted), snapshotN: p.SnapshotN, suspendedAt: p.SuspendedAt}
 		if len(p.Policy) > 0 {
 			rec.policy = &ateapipb.EgressPolicy{}
 			if err := proto.Unmarshal(p.Policy, rec.policy); err != nil {

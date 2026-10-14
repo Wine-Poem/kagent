@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: ate-snapshot-store, namespace: ate-system}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 5Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ate-snapshot-store, namespace: ate-system, labels: {app: ate-snapshot-store}}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: ate-snapshot-store}}
+  template:
+    metadata:
+      labels: {app: ate-snapshot-store}
+    spec:
+      containers:
+      - name: store
+        image: <registry>/kagent-fargate-probe:<tag>
+        command: ["/fargate-shim", "store", "--listen=:8080", "--dir=/var/lib/ate-snapshots", "--secret-file=/etc/ate-snapshot/secret"]
+        ports: [{containerPort: 8080}]
+        readinessProbe: {tcpSocket: {port: 8080}, periodSeconds: 3}
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 500m, memory: 256Mi}}
+        volumeMounts:
+        - {name: data, mountPath: /var/lib/ate-snapshots}
+        - {name: secret, mountPath: /etc/ate-snapshot, readOnly: true}
+      volumes:
+      - {name: data, persistentVolumeClaim: {claimName: ate-snapshot-store}}
+      - {name: secret, secret: {secretName: ate-snapshot-secret}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ate-snapshot-store, namespace: ate-system}
+spec:
+  selector: {app: ate-snapshot-store}
+  ports: [{port: 8080, targetPort: 8080}]

@@ -15,21 +15,22 @@ import (
 type fakePods struct {
 	mu      sync.Mutex
 	pods    map[ref]podState
-	created []ref
+	started []startRequest
 	ready   bool
+	hints   int
 }
 
 func newFakePods(ready bool) *fakePods { return &fakePods{pods: map[ref]podState{}, ready: ready} }
 
-func (f *fakePods) Ensure(_ context.Context, actor *ateapipb.Actor, _ *ateapipb.ActorTemplate) error {
+func (f *fakePods) Start(_ context.Context, req startRequest) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	key := ref{actor.GetMetadata().GetAtespace(), actor.GetMetadata().GetName()}
+	key := ref{req.Actor.GetMetadata().GetAtespace(), req.Actor.GetMetadata().GetName()}
 	if _, ok := f.pods[key]; !ok {
-		f.created = append(f.created, key)
+		f.started = append(f.started, req)
 		f.pods[key] = podState{Exists: true, Ready: f.ready, IP: "10.0.0.7", Node: "fargate-ip-10-0-0-7"}
 	}
-	return nil
+	return key.name, nil
 }
 
 func (f *fakePods) State(_ context.Context, atespace, name string) (podState, error) {
@@ -45,15 +46,18 @@ func (f *fakePods) Delete(_ context.Context, atespace, name string) error {
 	return nil
 }
 
-func (f *fakePods) ListManaged(context.Context) ([]ref, error) {
+func (f *fakePods) List(context.Context) ([]podInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []ref
+	var out []podInfo
 	for key := range f.pods {
-		out = append(out, key)
+		out = append(out, podInfo{ref: key})
 	}
 	return out, nil
 }
+
+func (f *fakePods) Hint(*ateapipb.ActorTemplate) { f.mu.Lock(); f.hints++; f.mu.Unlock() }
+func (f *fakePods) Maintain(context.Context)     {}
 
 func testTemplate(atespace, name string) *ateapipb.ActorTemplate {
 	return &ateapipb.ActorTemplate{
@@ -127,7 +131,7 @@ func TestActorLifecycle(t *testing.T) {
 	if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED || actor.GetMetadata().GetUid() == "" {
 		t.Fatalf("a new actor is suspended and has a uid: %v", actor)
 	}
-	if len(pods.created) != 0 {
+	if len(pods.started) != 0 {
 		t.Fatal("creating an actor must not start a pod")
 	}
 	ref := &ateapipb.ObjectRef{Atespace: "ns", Name: "session-1"}
@@ -244,7 +248,7 @@ func TestStateSurvivesRestart(t *testing.T) {
 
 func TestBuildPodForFargate(t *testing.T) {
 	actor := &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Atespace: "ns", Name: "session-1", Uid: "uid-1"}}
-	pod, err := buildPod(actor, testTemplate("ns", "tpl"), podSettings{CPU: "500m", Memory: "1Gi"})
+	pod, err := buildPod(podOptions{Name: "session-1", Actor: actor, Template: testTemplate("ns", "tpl"), Settings: podSettings{CPU: "500m", Memory: "1Gi"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +288,7 @@ func TestBuildPodForFargate(t *testing.T) {
 func TestBuildPodRejectsUnsupportedVolumes(t *testing.T) {
 	template := testTemplate("ns", "tpl")
 	template.Volumes = append(template.Volumes, &ateapipb.Volume{Name: "guest", Image: &ateapipb.ImageVolumeSource{Reference: "x"}})
-	if _, err := buildPod(&ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Atespace: "ns", Name: "a"}}, template, podSettings{CPU: "1", Memory: "1Gi"}); err == nil {
+	if _, err := buildPod(podOptions{Name: "a", Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Atespace: "ns", Name: "a"}}, Template: template, Settings: podSettings{CPU: "1", Memory: "1Gi"}}); err == nil {
 		t.Fatal("image volumes are not supported on Fargate")
 	}
 }
@@ -310,7 +314,7 @@ func TestParseTarget(t *testing.T) {
 
 func TestBuildPodCanRunAsRoot(t *testing.T) {
 	actor := &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Atespace: "ns", Name: "session-1", Uid: "uid-1"}}
-	pod, err := buildPod(actor, testTemplate("ns", "tpl"), podSettings{CPU: "500m", Memory: "1Gi", RunAsRoot: true})
+	pod, err := buildPod(podOptions{Name: "session-1", Actor: actor, Template: testTemplate("ns", "tpl"), Settings: podSettings{CPU: "500m", Memory: "1Gi", RunAsRoot: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
