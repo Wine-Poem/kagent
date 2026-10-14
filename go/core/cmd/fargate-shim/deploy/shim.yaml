@@ -33,7 +33,7 @@ spec:
       serviceAccountName: ate-fargate-shim
       containers:
       - name: shim
-        image: <registry>/kagent-fargate-probe:<tag>
+        image: __IMAGE__
         args:
         - --suspend-grace=10m
         - --actor-cpu=400m
@@ -45,7 +45,7 @@ spec:
         - name: POD_NAMESPACE
           valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
         - name: HELPER_IMAGE
-          value: <registry>/kagent-fargate-probe:<tag>
+          value: __IMAGE__
         ports: [{name: grpc, containerPort: 8443}, {name: router, containerPort: 8080}]
         readinessProbe: {tcpSocket: {port: 8443}, periodSeconds: 3}
         resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: 250m, memory: 512Mi}}

@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: echollm, namespace: kagent, labels: {app: echollm}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: echollm}}
+  template:
+    metadata:
+      labels: {app: echollm, compute-type: fargate}
+    spec:
+      containers:
+      - name: echollm
+        image: <registry>/kagent-fargate-probe:<tag>
+        command: ["/echollm", "-listen=:8080"]
+        ports: [{containerPort: 8080}]
+        readinessProbe: {tcpSocket: {port: 8080}, periodSeconds: 3}
+        resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: 250m, memory: 512Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: echollm, namespace: kagent}
+spec:
+  selector: {app: echollm}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata: {name: echo-model, namespace: kagent}
+spec:
+  provider: OpenAI
+  model: echo-model
+  apiKeySecret: mock-openai
+  apiKeySecretKey: OPENAI_API_KEY
+  stream: false
+  openAI:
+    baseUrl: http://echollm.kagent.svc:8080/v1
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata: {name: echo-agent, namespace: kagent}
+spec:
+  harnessRef: {name: fargate-kagent}
+  template:
+    inline:
+      modelConfig: {name: echo-model}
+      systemPrompt: "You are an echo agent."
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata: {name: hitl-agent, namespace: kagent}
+spec:
+  harnessRef: {name: fargate-kagent}
+  template:
+    inline:
+      modelConfig: {name: mock-model}
+      systemPrompt: "You ask the user when you need a decision."

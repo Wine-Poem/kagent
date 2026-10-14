@@ -2,6 +2,8 @@ providers: null
 podLabels:
   compute-type: fargate
 config:
+  sandboxes:
+    guestImage: ghcr.io/kagent-dev/kagent/sandbox-guest@sha256:<digest>
   substrate:
     apiEndpoint: dns:///api.ate-system.svc:443
     routerUrl: http://atenet-router.ate-system.svc:80
@@ -9,7 +11,7 @@ config:
 substrateWorkerPool:
   create: true
   name: kagent-default
-  workerImage: unused-placeholder
+  workerImage: ghcr.io/kagent-dev/substrate/ateom-gvisor:latest
   sandboxClass: gvisor
 controller:
   volumes:

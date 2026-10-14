@@ -72,6 +72,29 @@ func (s *snapshots) delete(ctx context.Context, uid string) error {
 	return nil
 }
 
+// copy duplicates one object of the store, for example an Actor's data into a tag or a tag into
+// a new Actor. A source without data gives an empty destination.
+func (s *snapshots) copy(ctx context.Context, srcUID, dstUID string) error {
+	if !s.enabled() {
+		return fmt.Errorf("no snapshot store")
+	}
+	url := strings.TrimRight(s.baseURL, "/") + "/v1/data/" + dstUID + "?copy-from=" + srcUID
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Ate-Admin", tokenFor(s.secret, "admin"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("copy snapshot: %s", resp.Status)
+	}
+	return nil
+}
+
 // storeHandler keeps one gzip tar per Actor UID on a local volume.
 func storeHandler(dir string, secret []byte) http.Handler {
 	var mu sync.Mutex
@@ -88,6 +111,17 @@ func storeHandler(dir string, secret []byte) http.Handler {
 		mu.Lock()
 		defer mu.Unlock()
 		switch {
+		case r.Method == http.MethodPost && admin:
+			src, err := uuid.Parse(r.URL.Query().Get("copy-from"))
+			if err != nil {
+				http.Error(w, "copy-from must be a uuid", http.StatusBadRequest)
+				return
+			}
+			if err := copyObject(filepath.Join(dir, src.String()+".tar.gz"), file, dir); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodDelete && admin:
 			if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -175,14 +209,20 @@ func tarDir(w io.Writer, dir string) error {
 	return gz.Close()
 }
 
-// untar refuses absolute paths, parent references and every entry that is not a
-// plain file or directory, so a snapshot cannot write outside the target.
+// untar restores a gzip tar made by tarDir. It refuses absolute paths, parent references and
+// every entry that is not a plain file or directory, so a snapshot cannot write outside the target.
 func untar(r io.Reader, dest string) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return err
 	}
-	tr := tar.NewReader(gz)
+	return untarEntries(tar.NewReader(gz), dest, true)
+}
+
+// untarEntries writes files and directories under dest. With strict set, other entry types are an
+// error; without it they are skipped, which suits unpacking a container image whose symlinks the
+// sandbox guest does not need.
+func untarEntries(tr *tar.Reader, dest string, strict bool) error {
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -193,7 +233,7 @@ func untar(r io.Reader, dest string) error {
 		}
 		name := filepath.Clean(filepath.FromSlash(hdr.Name))
 		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("unsafe path %q in snapshot", hdr.Name)
+			return fmt.Errorf("unsafe path %q in archive", hdr.Name)
 		}
 		target := filepath.Join(dest, name)
 		switch hdr.Typeflag {
@@ -217,7 +257,9 @@ func untar(r io.Reader, dest string) error {
 				return err
 			}
 		default:
-			return fmt.Errorf("unsupported entry %q in snapshot", hdr.Name)
+			if strict {
+				return fmt.Errorf("unsupported entry %q in archive", hdr.Name)
+			}
 		}
 	}
 }
@@ -310,4 +352,33 @@ func requestSave(ctx context.Context, podIP string, ref snapshotRef) error {
 		return fmt.Errorf("sidecar save: %s", resp.Status)
 	}
 	return nil
+}
+
+// copyObject copies src to dst atomically. A missing src removes dst, so a fork of an actor
+// that never saved anything starts empty.
+func copyObject(src, dst, dir string) error {
+	in, err := os.Open(src)
+	if os.IsNotExist(err) {
+		if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp, err := os.CreateTemp(dir, "copy.*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), dst)
 }

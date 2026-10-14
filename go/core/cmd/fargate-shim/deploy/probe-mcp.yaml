@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: mockmcp, namespace: kagent, labels: {app: mockmcp}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: mockmcp}}
+  template:
+    metadata:
+      labels: {app: mockmcp, compute-type: fargate}
+    spec:
+      containers:
+      - name: mockmcp
+        image: <registry>/kagent-fargate-probe:<tag>
+        command: ["/mockmcp", "--addr=:8080"]
+        ports: [{containerPort: 8080}]
+        readinessProbe: {tcpSocket: {port: 8080}, periodSeconds: 3}
+        resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: 250m, memory: 512Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: mockmcp, namespace: kagent}
+spec:
+  selector: {app: mockmcp}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: RemoteMCPServer
+metadata: {name: mock-mcp, namespace: kagent}
+spec:
+  description: Mock MCP server for the Fargate probe
+  protocol: STREAMABLE_HTTP
+  url: http://mockmcp.kagent.svc:8080/mcp
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata: {name: mcp-agent, namespace: kagent}
+spec:
+  harnessRef: {name: fargate-kagent}
+  template:
+    inline:
+      modelConfig: {name: mock-model}
+      description: MCP tool test
+      systemPrompt: "Use the configured MCP tool. Do not calculate the answer yourself."
+      tools:
+      - mcp:
+          server: {kind: RemoteMCPServer, name: mock-mcp}
+          tools: [add_numbers]

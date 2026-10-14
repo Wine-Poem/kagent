@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"flag"
@@ -14,6 +15,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
 // runWrapper is the entry point of a warm pod. It waits idle, and when the shim sends
@@ -156,4 +161,28 @@ func runStore(args []string) error {
 		return err
 	}
 	return (&http.Server{Addr: *listen, Handler: storeHandler(*dir, []byte(strings.TrimSpace(string(secret)))), ReadHeaderTimeout: 10 * time.Second}).ListenAndServe()
+}
+
+// runExtract unpacks a container image's filesystem into a directory. It stands in for a
+// Substrate image volume: Fargate has none, so an init container fills an emptyDir instead.
+func runExtract(args []string) error {
+	fs := flag.NewFlagSet("extract", flag.ExitOnError)
+	image := fs.String("image", "", "image reference")
+	dest := fs.String("dest", "/mnt", "directory to unpack into")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ref, err := name.ParseReference(*image)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	img, err := remote.Image(ref, remote.WithContext(ctx))
+	if err != nil {
+		return fmt.Errorf("pull %s: %w", *image, err)
+	}
+	rc := mutate.Extract(img)
+	defer rc.Close()
+	return untarEntries(tar.NewReader(rc), *dest, false)
 }

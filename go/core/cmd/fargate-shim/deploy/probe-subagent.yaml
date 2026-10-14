@@ -1,0 +1,164 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: mockllm-shared, namespace: kagent}
+data:
+  config.json: |
+    {
+      "openai": [
+        {
+          "name": "delegate_to_shared_agent",
+          "match": {
+            "match_type": "contains",
+            "message": {
+              "content": "Ask the specialist",
+              "role": "user"
+            },
+            "headers": [
+              {
+                "name": "X-Kagent-E2E-Agent",
+                "value": "root"
+              }
+            ]
+          },
+          "response": {
+            "id": "chatcmpl-shared-root",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4.1-mini",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "content": "",
+                  "role": "assistant",
+                  "tool_calls": [
+                    {
+                      "id": "call_shared",
+                      "type": "function",
+                      "function": {
+                        "name": "transfer_to_agent",
+                        "arguments": "{\"agent_name\":\"specialist\"}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ]
+          }
+        },
+        {
+          "name": "shared_agent_response",
+          "match": {
+            "match_type": "contains",
+            "message": {
+              "content": "",
+              "role": "user"
+            },
+            "headers": [
+              {
+                "name": "X-Kagent-E2E-Agent",
+                "value": "child"
+              }
+            ]
+          },
+          "response": {
+            "id": "chatcmpl-shared-child",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4.1-mini",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "content": "Answer from the shared specialist.",
+                  "role": "assistant"
+                },
+                "finish_reason": "stop"
+              }
+            ]
+          }
+        }
+      ],
+      "listen_addr": "0.0.0.0:8080"
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: mockllm-shared, namespace: kagent, labels: {app: mockllm-shared}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: mockllm-shared}}
+  template:
+    metadata:
+      labels: {app: mockllm-shared, compute-type: fargate}
+    spec:
+      containers:
+      - name: mockllm
+        image: <registry>/kagent-fargate-probe:<tag>
+        command: ["/mockllm", "-config", "/etc/mockllm/config.json"]
+        ports: [{containerPort: 8080}]
+        readinessProbe: {tcpSocket: {port: 8080}, periodSeconds: 3}
+        resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: 250m, memory: 512Mi}}
+        volumeMounts: [{name: cfg, mountPath: /etc/mockllm}]
+      volumes: [{name: cfg, configMap: {name: mockllm-shared}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: mockllm-shared, namespace: kagent}
+spec:
+  selector: {app: mockllm-shared}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata: {name: shared-root-model, namespace: kagent}
+spec:
+  provider: OpenAI
+  model: root-model
+  apiKeySecret: mock-openai
+  apiKeySecretKey: OPENAI_API_KEY
+  stream: false
+  defaultHeaders: {X-Kagent-E2E-Agent: root}
+  openAI: {baseUrl: "http://mockllm-shared.kagent.svc:8080/v1"}
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata: {name: shared-child-model, namespace: kagent}
+spec:
+  provider: OpenAI
+  model: child-model
+  apiKeySecret: mock-openai
+  apiKeySecretKey: OPENAI_API_KEY
+  stream: false
+  defaultHeaders: {X-Kagent-E2E-Agent: child}
+  openAI: {baseUrl: "http://mockllm-shared.kagent.svc:8080/v1"}
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata: {name: shared-child, namespace: kagent}
+spec:
+  modelConfig: {name: shared-child-model}
+  description: Shared specialist
+  systemPrompt: Answer as the shared specialist.
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata: {name: shared-root, namespace: kagent}
+spec:
+  modelConfig: {name: shared-root-model}
+  description: Root agent that delegates
+  systemPrompt: Delegate every request to the specialist.
+  tools:
+  - subAgent:
+      name: specialist
+      description: Handles specialist requests
+      templateRef: {name: shared-child}
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata: {name: shared-agent, namespace: kagent}
+spec:
+  harnessRef: {name: fargate-kagent}
+  template:
+    ref: {name: shared-root}

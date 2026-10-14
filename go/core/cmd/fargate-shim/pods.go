@@ -245,10 +245,18 @@ func buildPod(o podOptions) (*corev1.Pod, error) {
 	}
 	identityName, _, _ := identityVolume(template)
 	var volumes []corev1.Volume
+	var imageVolumes []*ateapipb.Volume
 	for _, v := range template.GetVolumes() {
 		switch {
 		case v.GetDurableDir() != nil:
 			volumes = append(volumes, corev1.Volume{Name: v.GetName(), VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+		case v.GetImage() != nil:
+			// Fargate has no image volumes: an init container unpacks the image into an emptyDir.
+			if settings.HelperImage == "" {
+				return nil, fmt.Errorf("volume %s: image volumes need the helper image", v.GetName())
+			}
+			volumes = append(volumes, corev1.Volume{Name: v.GetName(), VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+			imageVolumes = append(imageVolumes, v)
 		case v.GetSystemInfo() != nil && o.warm() && v.GetName() == identityName:
 			// The wrapper writes the identity files when it activates the pod.
 			volumes = append(volumes, corev1.Volume{Name: v.GetName(), VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
@@ -266,7 +274,7 @@ func buildPod(o podOptions) (*corev1.Pod, error) {
 	for _, m := range c.GetVolumeMounts() {
 		mounts = append(mounts, corev1.VolumeMount{Name: m.GetName(), MountPath: m.GetMountPath()})
 	}
-	cpu, memory := resource.MustParse(settings.CPU), resource.MustParse(settings.Memory)
+	cpu, memory := containerSize(template, settings)
 	container := corev1.Container{
 		Name: c.GetName(), Image: c.GetImage(), Command: c.GetCommand(), Args: c.GetArgs(),
 		Env: env, VolumeMounts: mounts, Resources: requests(cpu, memory),
@@ -283,6 +291,14 @@ func buildPod(o podOptions) (*corev1.Pod, error) {
 			Name: "install-wrapper", Image: settings.HelperImage, Command: []string{helperBinary, "install", "--dest=" + wrapperPath},
 			VolumeMounts: []corev1.VolumeMount{{Name: "ate-bin", MountPath: wrapperDir}}, SecurityContext: helperSecurity,
 			Resources: requests(resource.MustParse("50m"), resource.MustParse("64Mi")),
+		})
+	}
+	for _, v := range imageVolumes {
+		initContainers = append(initContainers, corev1.Container{
+			Name: "extract-" + v.GetName(), Image: settings.HelperImage, SecurityContext: helperSecurity,
+			Command:      []string{helperBinary, "extract", "--image=" + v.GetImage().GetReference(), "--dest=/mnt"},
+			VolumeMounts: []corev1.VolumeMount{{Name: v.GetName(), MountPath: "/mnt"}},
+			Resources:    requests(resource.MustParse("100m"), resource.MustParse("128Mi")),
 		})
 	}
 	if probe := c.GetWakeupProbe().GetHttpGet(); probe != nil {
@@ -387,4 +403,23 @@ func systemInfoVolume(info *ateapipb.SystemInfoVolumeSource) (corev1.VolumeSourc
 		}}, nil
 	}
 	return corev1.VolumeSource{}, fmt.Errorf("system info volume must hold either actor metadata or a trust bundle")
+}
+
+// containerSize takes the limits of the template when it sets them, as sandboxes do, and the
+// shim's defaults otherwise.
+func containerSize(template *ateapipb.ActorTemplate, settings podSettings) (cpu, memory resource.Quantity) {
+	cpu, memory = resource.MustParse(settings.CPU), resource.MustParse(settings.Memory)
+	for _, limit := range template.GetResources().GetLimits() {
+		q, err := resource.ParseQuantity(limit.GetQuantity())
+		if err != nil || q.Sign() <= 0 {
+			continue
+		}
+		switch limit.GetName() {
+		case "cpu":
+			cpu = q
+		case "memory":
+			memory = q
+		}
+	}
+	return cpu, memory
 }

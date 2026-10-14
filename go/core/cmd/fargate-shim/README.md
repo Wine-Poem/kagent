@@ -73,3 +73,38 @@ ate-snapshot-secret --from-literal=secret="$(openssl rand -hex 24)"`.
 Only `/data` is kept. Process memory and anything written outside `/data` are lost when a
 pod goes away, and data written after the last suspend is lost if the pod dies before the
 next one.
+
+## What works
+
+Verified on EKS Fargate with `probe` and the kagent CLI:
+
+- Sessions: create, A2A request and streaming, delete, idle expiration, many sessions at once.
+- Human in the loop: an `ask_user` pause keeps the pod; the answer resumes the paused operation,
+  also when the pod was lost in the meantime (Pause saves `/data` first).
+- Checkpoints and forks: a checkpoint keeps a copy of the saved `/data`, a fork starts a new Actor
+  from it. The snapshot scope is DATA when the snapshot store is on, which is what kagent needs to
+  allow forks.
+- Standalone sandboxes: create, exec, file upload and download, suspend and resume (the workspace
+  is restored), delete. The guest image is unpacked into an `emptyDir` by an init container.
+- Tools over MCP and shared sub-agents (they run inside the session's pod).
+- Recovery: a lost pod shows up as SUSPENDED and the next request starts a new pod that restores
+  `/data`; controller and shim restarts do not interrupt sessions.
+
+## What does not work
+
+- Credential injection: the runtime keeps the placeholder API key `kagent-credential-injected`.
+  Use a provider that needs no key from the pod (Bedrock with IRSA), or a model server inside the
+  cluster.
+- Egress allow-lists: the policy is stored but not enforced.
+- Process-memory snapshots: only `/data` survives a pod loss.
+- Substrate sandbox classes (gVisor, microVM), workers, JWT minting, access policies.
+
+A resume call reports RUNNING after `--resume-wait` even if the pod is still starting: kagent gives
+the call 30 seconds, a cold Fargate pod needs about 45, and the router holds requests until the pod
+is ready. A sandbox created from a cold template therefore answers its first request slowly; with a
+ready warm pod it is quick.
+
+`probe` (`go run ./core/cmd/fargate-shim/probe -agent NAME stream|hitl|fork|isolation`) and the
+`deploy/probe-*.yaml` fixtures reproduce the tests. `echollm` is a model that reports how many user
+turns it received and whether a marker word is in the history, which shows what a restored or
+forked session still remembers.

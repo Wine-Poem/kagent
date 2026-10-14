@@ -473,3 +473,25 @@ func TestMaintainTopsUpPoolsAndDropsStaleOnes(t *testing.T) {
 		t.Error("a young pod is left alone")
 	}
 }
+
+func TestPauseSavesDataButKeepsThePod(t *testing.T) {
+	pods := newFakePods(true)
+	s := newPersistentServer(t, pods, "http://store")
+	var saved int
+	s.save = func(context.Context, string, snapshotRef) error { saved++; return nil }
+	createActor(t, s)
+	obj := &ateapipb.ObjectRef{Atespace: "ns", Name: "session-1"}
+	if _, err := s.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{Actor: obj}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := s.PauseActor(context.Background(), &ateapipb.PauseActorRequest{Actor: obj})
+	if err != nil || resp.GetActor().GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_PAUSED {
+		t.Fatalf("pause: %v %v", resp, err)
+	}
+	if saved != 1 {
+		t.Fatalf("pause saves /data once, saved %d times", saved)
+	}
+	if state, _ := pods.State(context.Background(), "ns", "session-1"); !state.Exists {
+		t.Fatal("pause keeps the pod, so the paused operation resumes instantly")
+	}
+}

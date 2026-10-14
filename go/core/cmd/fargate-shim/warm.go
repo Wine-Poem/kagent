@@ -70,6 +70,8 @@ func specKey(template *ateapipb.ActorTemplate, settings podSettings) string {
 		raw, _ := marshal.Marshal(v)
 		h.Write(raw)
 	}
+	raw, _ := marshal.Marshal(template.GetResources())
+	h.Write(raw)
 	for _, m := range c.GetVolumeMounts() {
 		raw, _ := marshal.Marshal(m)
 		h.Write(raw)

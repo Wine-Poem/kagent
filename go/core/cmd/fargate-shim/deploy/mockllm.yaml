@@ -6,12 +6,182 @@ data:
     {
       "listen_addr": "0.0.0.0:8080",
       "openai": [
-        {"name": "probe", "match": {"match_type": "contains", "message": {"role": "user", "content": "Fargate probe"}},
-         "response": {"id": "chatcmpl-1", "object": "chat.completion", "created": 1677652288, "model": "mock-model",
-           "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello from a Fargate microVM session pod."}, "finish_reason": "stop"}]}},
-        {"name": "catch-all", "match": {"match_type": "contains", "message": {"role": "user", "content": ""}},
-         "response": {"id": "chatcmpl-2", "object": "chat.completion", "created": 1677652288, "model": "mock-model",
-           "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]}}
+        {
+          "name": "initial_request",
+          "match": {
+            "match_type": "contains",
+            "message": {
+              "content": "add 3 and 5",
+              "role": "user"
+            }
+          },
+          "response": {
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4.1-mini",
+            "choices": [
+              {
+                "index": 0,
+                "role": "assistant",
+                "message": {
+                  "content": "",
+                  "tool_calls": [
+                    {
+                      "id": "call_1",
+                      "type": "function",
+                      "function": {
+                        "name": "add_numbers",
+                        "arguments": "{\"a\": 3, \"b\": 5}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ]
+          }
+        },
+        {
+          "name": "add_response",
+          "match": {
+            "match_type": "contains",
+            "message": {
+              "content": "8",
+              "role": "tool",
+              "tool_call_id": "call_1"
+            }
+          },
+          "response": {
+            "id": "call_1",
+            "object": "chat.completion.tool_message",
+            "created": 1677652288,
+            "model": "gpt-4.1-mini",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "content": "I have added 3 and 5. The result is 8.",
+                  "role": "assistant"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "ask_user_request",
+          "match": {
+            "match_type": "contains",
+            "message": {
+              "content": "Which database should we use for storage?",
+              "role": "user"
+            }
+          },
+          "response": {
+            "id": "chatcmpl-hitl-ask-1",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4.1-mini",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "call_ask_1",
+                      "type": "function",
+                      "function": {
+                        "name": "ask_user",
+                        "arguments": "{\"questions\":[{\"question\":\"Which database should we use?\",\"choices\":[\"PostgreSQL\",\"MySQL\"]}]}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ]
+          }
+        },
+        {
+          "name": "ask_user_answered",
+          "match": {
+            "match_type": "contains",
+            "message": {
+              "content": "PostgreSQL",
+              "role": "tool"
+            }
+          },
+          "response": {
+            "id": "chatcmpl-hitl-ask-2",
+            "object": "chat.completion",
+            "created": 1677652289,
+            "model": "gpt-4.1-mini",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "Using PostgreSQL for storage."
+                },
+                "finish_reason": "stop"
+              }
+            ]
+          }
+        },
+        {
+          "name": "probe",
+          "match": {
+            "match_type": "contains",
+            "message": {
+              "role": "user",
+              "content": "Fargate probe"
+            }
+          },
+          "response": {
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "mock-model",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "Hello from a Fargate microVM session pod."
+                },
+                "finish_reason": "stop"
+              }
+            ]
+          }
+        },
+        {
+          "name": "catch-all",
+          "match": {
+            "match_type": "contains",
+            "message": {
+              "role": "user",
+              "content": ""
+            }
+          },
+          "response": {
+            "id": "chatcmpl-2",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "mock-model",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "ok"
+                },
+                "finish_reason": "stop"
+              }
+            ]
+          }
+        }
       ]
     }
 ---

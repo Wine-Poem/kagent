@@ -78,6 +78,7 @@ type server struct {
 	atespaces map[string]*ateapipb.Atespace
 	templates map[ref]*ateapipb.ActorTemplate
 	actors    map[ref]*actorRecord
+	tags      map[ref]*ateapipb.Tag
 	pods      podManager
 	persist   func([]byte) error
 	cfg       config
@@ -90,6 +91,7 @@ func newServer(pods podManager, persist func([]byte) error, cfg config) *server 
 		atespaces: map[string]*ateapipb.Atespace{},
 		templates: map[ref]*ateapipb.ActorTemplate{},
 		actors:    map[ref]*actorRecord{},
+		tags:      map[ref]*ateapipb.Tag{},
 		pods:      pods, persist: persist, cfg: cfg, now: time.Now, save: requestSave,
 	}
 }
@@ -196,31 +198,58 @@ func (s *server) DeleteActorTemplate(_ context.Context, req *ateapipb.DeleteActo
 	return found, s.saveLocked()
 }
 
-func (s *server) CreateActor(_ context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
+func (s *server) CreateActor(ctx context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
 	actor := req.GetActor()
 	key := ref{actor.GetMetadata().GetAtespace(), actor.GetMetadata().GetName()}
 	if key.atespace == "" || key.name == "" {
 		return nil, status.Error(codes.InvalidArgument, "actor needs an atespace and a name")
 	}
-	if actor.GetSourceTag() != nil {
-		return nil, status.Error(codes.Unimplemented, "restoring an actor from a tag needs snapshots, which Fargate does not provide")
-	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, ok := s.atespaces[key.atespace]; !ok {
+		s.mu.Unlock()
 		return nil, status.Error(codes.FailedPrecondition, "atespace does not exist")
 	}
 	template, ok := s.templates[refOf(actor.GetActorTemplate())]
 	if !ok {
+		s.mu.Unlock()
 		return nil, status.Error(codes.NotFound, "actor template not found")
 	}
 	if _, ok := s.actors[key]; ok {
+		s.mu.Unlock()
 		return nil, status.Error(codes.AlreadyExists, "actor exists")
 	}
 	stored := &ateapipb.Actor{
 		Metadata:       meta(key),
 		ActorTemplate:  &ateapipb.ObjectRef{Atespace: actor.GetActorTemplate().GetAtespace(), Name: actor.GetActorTemplate().GetName()},
 		WorkerSelector: template.GetWorkerSelector(),
+	}
+	var tag *ateapipb.Tag
+	if source := actor.GetSourceTag(); source != nil {
+		tag = s.tags[refOf(source)]
+		switch {
+		case !s.cfg.Snapshots.enabled():
+			s.mu.Unlock()
+			return nil, status.Error(codes.Unimplemented, "forking needs the snapshot store")
+		case tag == nil:
+			s.mu.Unlock()
+			return nil, status.Error(codes.NotFound, "tag not found")
+		case tag.GetStatus().GetActorTemplateUid() != template.GetMetadata().GetUid():
+			s.mu.Unlock()
+			return nil, status.Error(codes.FailedPrecondition, "the tag was taken from a different template revision")
+		}
+		stored.SourceTag = &ateapipb.ObjectRef{Atespace: source.GetAtespace(), Name: source.GetName()}
+	}
+	s.mu.Unlock()
+	if tag != nil {
+		// The new Actor starts from its own copy, so later saves never touch the tag.
+		if err := s.cfg.Snapshots.copy(ctx, tag.GetMetadata().GetUid(), stored.GetMetadata().GetUid()); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "copy the tag's data: %v", err)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.actors[key]; ok {
+		return nil, status.Error(codes.AlreadyExists, "actor exists")
 	}
 	rec := &actorRecord{actor: stored, wanted: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, suspendedAt: s.now()}
 	s.actors[key] = rec
@@ -274,7 +303,13 @@ func (s *server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 	if !ok {
 		return nil, status.Error(codes.NotFound, "actor not found")
 	}
-	return &ateapipb.ResumeActorResponse{Actor: s.viewLocked(ctx, rec), Resumed: true}, nil
+	view := s.viewLocked(ctx, rec)
+	if view.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RESUMING {
+		// kagent gives a resume call 30 seconds, a cold Fargate pod needs about 45. The resume is
+		// accepted: the pod is on its way and the router holds requests until it is ready.
+		view.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
+	}
+	return &ateapipb.ResumeActorResponse{Actor: view, Resumed: true}, nil
 }
 
 func (s *server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
@@ -297,9 +332,15 @@ func (s *server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorReq
 }
 
 func (s *server) PauseActor(ctx context.Context, req *ateapipb.PauseActorRequest) (*ateapipb.PauseActorResponse, error) {
+	key := refOf(req.GetActor())
+	// A paused task waits for a human, possibly for long. Saving /data lets a new pod continue it
+	// if this pod is lost in the meantime; the pod itself stays, so the usual resume is instant.
+	if err := s.saveData(ctx, key); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok := s.actors[refOf(req.GetActor())]
+	rec, ok := s.actors[key]
 	if !ok {
 		return nil, status.Error(codes.NotFound, "actor not found")
 	}
@@ -470,6 +511,28 @@ func (s *server) saveData(ctx context.Context, key ref) error {
 	return nil
 }
 
+// snapshotLocked describes what a suspended actor resumes from. It is a marker: the pod may
+// linger for the grace period, and a new pod restores /data from the store but not process
+// memory. With a store the scope is DATA, which lets kagent checkpoint and fork the actor;
+// without one the scope is FULL, which kagent refuses to fork.
+func (s *server) snapshotLocked(rec *actorRecord) *ateapipb.ExternalSnapshot {
+	scope := ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL
+	if s.cfg.Snapshots.enabled() {
+		scope = ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA
+	}
+	templateUID := s.templates[refOf(rec.actor.GetActorTemplate())].GetMetadata().GetUid()
+	if source := rec.actor.GetSourceTag(); source != nil && rec.snapshotN == 0 {
+		if tag := s.tags[refOf(source)]; tag != nil {
+			return proto.Clone(tag.GetStatus().GetSnapshot()).(*ateapipb.ExternalSnapshot)
+		}
+	}
+	return &ateapipb.ExternalSnapshot{
+		SnapshotUri:      fmt.Sprintf("fargate-shim://%s/%s/%d", rec.actor.GetMetadata().GetAtespace(), rec.actor.GetMetadata().GetUid(), rec.snapshotN),
+		ContentScope:     scope,
+		ActorTemplateUid: templateUID,
+	}
+}
+
 func (s *server) viewLocked(ctx context.Context, rec *actorRecord) *ateapipb.Actor {
 	view := proto.Clone(rec.actor).(*ateapipb.Actor)
 	key := ref{rec.actor.GetMetadata().GetAtespace(), rec.actor.GetMetadata().GetName()}
@@ -484,20 +547,17 @@ func (s *server) viewLocked(ctx context.Context, rec *actorRecord) *ateapipb.Act
 		case err == nil && pod.Exists:
 			state = ateapipb.ActorState_ACTOR_STATE_RESUMING
 		default:
-			state = ateapipb.ActorState_ACTOR_STATE_CRASHED
-			view.Status.Crash = &ateapipb.ActorCrash{Message: "pod is gone", CrashTime: timestamppb.New(s.now())}
+			// A lost pod (node maintenance, OOM, deletion) is not a crash kagent can act on: it only
+			// resumes SUSPENDED actors. Report SUSPENDED, so the next request starts a new pod
+			// that restores the data of the last suspend.
+			state = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+			view.Status.ExternalSnapshot = s.snapshotLocked(rec)
 		}
 		view.Status.AssignedNode = pod.Node
 	case ateapipb.ActorState_ACTOR_STATE_PAUSED:
 		state = ateapipb.ActorState_ACTOR_STATE_PAUSED
 	default:
-		// The snapshot is only a marker: the pod may linger for the grace period and a new
-		// pod starts fresh afterwards, so process memory and /data are not preserved.
-		view.Status.ExternalSnapshot = &ateapipb.ExternalSnapshot{
-			SnapshotUri:      fmt.Sprintf("fargate-shim://%s/%s/%d", key.atespace, rec.actor.GetMetadata().GetUid(), rec.snapshotN),
-			ContentScope:     ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
-			ActorTemplateUid: s.templates[refOf(rec.actor.GetActorTemplate())].GetMetadata().GetUid(),
-		}
+		view.Status.ExternalSnapshot = s.snapshotLocked(rec)
 	}
 	view.Status.State = state
 	return view
@@ -578,6 +638,7 @@ type persisted struct {
 	Atespaces []string                `json:"atespaces"`
 	Templates map[string][]byte       `json:"templates"`
 	Actors    map[string]persistedRec `json:"actors"`
+	Tags      map[string][]byte       `json:"tags,omitempty"`
 }
 
 type persistedRec struct {
@@ -593,7 +654,14 @@ func (s *server) saveLocked() error {
 	if s.persist == nil {
 		return nil
 	}
-	state := persisted{Templates: map[string][]byte{}, Actors: map[string]persistedRec{}}
+	state := persisted{Templates: map[string][]byte{}, Actors: map[string]persistedRec{}, Tags: map[string][]byte{}}
+	for key, tag := range s.tags {
+		raw, err := proto.Marshal(tag)
+		if err != nil {
+			return status.Errorf(codes.Internal, "marshal tag: %v", err)
+		}
+		state.Tags[key.String()] = raw
+	}
 	for name := range s.atespaces {
 		state.Atespaces = append(state.Atespaces, name)
 	}
@@ -643,6 +711,13 @@ func (s *server) load(raw []byte) error {
 			return err
 		}
 		s.templates[ref{t.GetMetadata().GetAtespace(), t.GetMetadata().GetName()}] = t
+	}
+	for _, raw := range state.Tags {
+		tag := &ateapipb.Tag{}
+		if err := proto.Unmarshal(raw, tag); err != nil {
+			return err
+		}
+		s.tags[ref{tag.GetMetadata().GetAtespace(), tag.GetMetadata().GetName()}] = tag
 	}
 	for _, p := range state.Actors {
 		actor := &ateapipb.Actor{}
