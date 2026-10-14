@@ -54,7 +54,7 @@ func run() error {
 	actorSA := flag.String("actor-service-account", "", "service account of actor pods")
 	runAsRoot := flag.Bool("actor-run-as-root", true, "run actor containers as root, like inside a Substrate sandbox")
 	grace := flag.Duration("suspend-grace", 10*time.Minute, "how long a suspended actor keeps its pod")
-	resumeWait := flag.Duration("resume-wait", 3*time.Second, "how long a resume call waits for the pod; it then reports RUNNING and the router holds requests")
+	resumeWait := flag.Duration("resume-wait", 25*time.Second, "how long a resume call waits for the pod; kagent gives the call 30 seconds and retries when the actor is still RESUMING")
 	eager := flag.Bool("eager-start", true, "start an actor's pod when it is created instead of at the first request")
 	warmSize := flag.Int("warm-pool", 0, "idle warm pods kept per runtime image; 0 turns the pool off")
 	warmTTL := flag.Duration("warm-idle-ttl", 30*time.Minute, "drop a warm pool nobody has used for this long")

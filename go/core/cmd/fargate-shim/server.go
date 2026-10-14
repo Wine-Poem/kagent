@@ -304,11 +304,6 @@ func (s *server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 		return nil, status.Error(codes.NotFound, "actor not found")
 	}
 	view := s.viewLocked(ctx, rec)
-	if view.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RESUMING {
-		// kagent gives a resume call 30 seconds, a cold Fargate pod needs about 45. The resume is
-		// accepted: the pod is on its way and the router holds requests until it is ready.
-		view.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
-	}
 	return &ateapipb.ResumeActorResponse{Actor: view, Resumed: true}, nil
 }
 

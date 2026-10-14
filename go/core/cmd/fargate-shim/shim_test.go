@@ -158,7 +158,7 @@ func TestActorLifecycle(t *testing.T) {
 	}
 }
 
-func TestResumeIsAcceptedWhilePodStarts(t *testing.T) {
+func TestResumeReportsResumingWhilePodStarts(t *testing.T) {
 	s := newTestServer(t, newFakePods(false))
 	s.cfg.ResumeWait = 1100 * time.Millisecond
 	createActor(t, s)
@@ -166,12 +166,8 @@ func TestResumeIsAcceptedWhilePodStarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.GetActor().GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_RUNNING {
-		t.Fatalf("an accepted resume reports RUNNING while the router holds requests, got %s", resp.GetActor().GetStatus().GetState())
-	}
-	view, err := s.GetActor(context.Background(), &ateapipb.GetActorRequest{Actor: &ateapipb.ObjectRef{Atespace: "ns", Name: "session-1"}})
-	if err != nil || view.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_RESUMING {
-		t.Fatalf("a read still shows the truth, a pod that is not ready is RESUMING: %v %v", view.GetStatus(), err)
+	if resp.GetActor().GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_RESUMING {
+		t.Fatalf("a pod that is not ready is RESUMING, so kagent retries instead of sending requests to a pod that cannot answer, got %s", resp.GetActor().GetStatus().GetState())
 	}
 }
 

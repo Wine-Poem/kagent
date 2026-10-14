@@ -99,10 +99,11 @@ Verified on EKS Fargate with `probe` and the kagent CLI:
 - Process-memory snapshots: only `/data` survives a pod loss.
 - Substrate sandbox classes (gVisor, microVM), workers, JWT minting, access policies.
 
-A resume call reports RUNNING after `--resume-wait` even if the pod is still starting: kagent gives
-the call 30 seconds, a cold Fargate pod needs about 45, and the router holds requests until the pod
-is ready. A sandbox created from a cold template therefore answers its first request slowly; with a
-ready warm pod it is quick.
+A resume call waits `--resume-wait` for the pod and then reports the real state. kagent gives the
+call 30 seconds and a cold Fargate pod needs about 45, so creating a sandbox from a template without
+a ready warm pod fails once with "retry with request-id" and the retry succeeds. Reporting RUNNING
+early is worse: the first request then misses its own deadline, and kagent warns that a command
+"may have started". With a ready warm pod the sandbox is usable at once.
 
 `probe` (`go run ./core/cmd/fargate-shim/probe -agent NAME stream|hitl|fork|isolation`) and the
 `deploy/probe-*.yaml` fixtures reproduce the tests. `echollm` is a model that reports how many user
