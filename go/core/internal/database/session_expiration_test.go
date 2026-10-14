@@ -55,7 +55,7 @@ func TestSessionExpirationTaskAdmission(t *testing.T) {
 func TestSessionExpirationRechecksActivity(t *testing.T) {
 	client, session := expirationFixture(t)
 	ctx := t.Context()
-	before := time.Now()
+	before := session.CreatedAt.AsTime()
 	ids, err := client.ListIdleSessions(ctx, before, "", 100)
 	require.NoError(t, err)
 	require.Equal(t, []string{session.Id}, ids)
@@ -64,13 +64,15 @@ func TestSessionExpirationRechecksActivity(t *testing.T) {
 	task.ContextID, task.Status.State = session.ContextId, a2a.TaskStateCompleted
 	version, err := client.CreateRuntimeTask(ctx, session.Id, taskMutationHash("completed"), task, "")
 	require.NoError(t, err)
-	savedBefore := time.Now()
-	_, err = client.BeginIdleSessionDeletion(ctx, session.Id, time.Now())
+	// Use the database clock because the Docker host clock can differ.
+	var savedBefore time.Time
+	require.NoError(t, client.db.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&savedBefore))
+	_, err = client.BeginIdleSessionDeletion(ctx, session.Id, savedBefore)
 	require.ErrorIs(t, err, ErrConflict, "unpublished runtime cleanup blocks expiration")
 	require.NoError(t, client.SettleSessionTask(ctx, session.Id, string(task.ID), version))
 	work, err := client.ClaimSessionQuiescence(ctx)
 	require.NoError(t, err)
-	_, err = client.BeginIdleSessionDeletion(ctx, session.Id, time.Now())
+	_, err = client.BeginIdleSessionDeletion(ctx, session.Id, savedBefore)
 	require.ErrorIs(t, err, ErrFailedPrecondition, "a claimed suspension blocks expiration")
 	require.NoError(t, client.FinishSessionQuiescence(ctx, work, &SessionTaskSnapshot{Atespace: "team-a", URI: "s3://snapshot", ContentScope: "FULL"}))
 	_, err = client.BeginIdleSessionDeletion(ctx, session.Id, before)
