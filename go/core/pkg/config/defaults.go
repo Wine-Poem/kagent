@@ -35,7 +35,8 @@ func DefaultController(cfg *apiv1.ControllerConfig) {
 		Database:         defaultDatabase(),
 		Substrate:        &apiv1.SubstrateConfig{ApiEndpoint: new("dns:///api.ate-system.svc:443"), RouterUrl: new("http://atenet-router.ate-system.svc:80")},
 		Sessions:         &apiv1.SessionsConfig{IdleTtl: durationpb.New(7 * 24 * time.Hour), ShareMaxTtl: durationpb.New(0), ExpirationInterval: durationpb.New(time.Minute), QuiescenceRecoveryInterval: durationpb.New(time.Minute)},
-		Gateway:          &apiv1.GatewayConfig{PublicUrl: new("http://localhost:8083"), Push: &apiv1.PushConfig{RecoveryInterval: durationpb.New(time.Minute)}},
+		Gateway:          &apiv1.GatewayConfig{PublicUrl: new("http://localhost:8083")},
+		Push:             &apiv1.PushConfig{RecoveryInterval: durationpb.New(time.Minute)},
 		Sandboxes:        &apiv1.SandboxConfig{Cpu: new("1"), Memory: new("1Gi"), DefaultTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(24 * time.Hour), ExpirationInterval: durationpb.New(time.Second)},
 		ScheduledRuns:    &apiv1.ScheduledRunsConfig{PollInterval: durationpb.New(time.Second), ExecutionInterval: durationpb.New(time.Second)},
 		RuntimeRevisions: &apiv1.RuntimeRevisionsConfig{GcInterval: durationpb.New(time.Minute)},
@@ -44,8 +45,8 @@ func DefaultController(cfg *apiv1.ControllerConfig) {
 		Telemetry:        &apiv1.TelemetryConfig{},
 		RuntimeDefaults:  &apiv1.RuntimeDefaultsConfig{ControlPlaneUrl: new("http://kagent-controller.kagent:8083"), GatewayUrl: new("http://kagent-controller.kagent:8083"), Logging: &apiv1.LoggingConfig{Level: new("info")}, Telemetry: &apiv1.TelemetryConfig{}},
 	})
-	if cfg.Gateway.Push.Issuer == nil {
-		cfg.Gateway.Push.Issuer = new(cfg.Gateway.GetPublicUrl())
+	if cfg.Push.Issuer == nil {
+		cfg.Push.Issuer = new(cfg.Gateway.GetPublicUrl())
 	}
 	defaultTelemetry(cfg.Telemetry)
 	defaultTelemetry(cfg.RuntimeDefaults.Telemetry)
@@ -71,7 +72,7 @@ func defaultTelemetry(cfg *apiv1.TelemetryConfig) {
 func ResolveControllerPaths(cfg *apiv1.ControllerConfig, path string) {
 	resolveLoginPath(cfg.Database.Owner, path)
 	resolveLoginPath(cfg.Database.ReadWrite, path)
-	cfg.Gateway.Push.SigningPrivateKeyFile = FilePath(path, cfg.Gateway.Push.SigningPrivateKeyFile)
+	cfg.Push.SigningPrivateKeyFile = FilePath(path, cfg.Push.SigningPrivateKeyFile)
 	cfg.Substrate.CaFile = FilePath(path, cfg.Substrate.CaFile)
 	cfg.Substrate.ClientCertFile = FilePath(path, cfg.Substrate.ClientCertFile)
 }
