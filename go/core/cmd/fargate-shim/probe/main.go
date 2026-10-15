@@ -43,13 +43,22 @@ func main() {
 	n := flag.Int("n", 5, "bench: sessions in the sequential phase")
 	conc := flag.Int("c", 8, "bench: sessions in the concurrent phase")
 	settle := flag.Duration("settle", 8*time.Second, "bench: wait after the first message so the runtime can quiesce")
+	hitlAgent := flag.String("hitl-agent", "", "perf: agent whose model asks the user")
+	mcpAgent := flag.String("mcp-agent", "", "perf: agent with the mock MCP tool")
+	sharedAgent := flag.String("shared-agent", "", "perf: agent with a shared sub-agent")
+	levels := flag.String("levels", "8,16", "perf: comma-separated concurrency levels")
+	cli := flag.String("cli", "kagent", "sandboxperf: kagent CLI binary")
+	apiURL := flag.String("api-url", "http://localhost:8083", "sandboxperf: kagent API URL for the CLI")
+	template := flag.String("template", "scratch", "sandboxperf: SandboxTemplate name")
+	timeout := flag.Duration("timeout", 10*time.Minute, "overall deadline of the run")
+	scenarios := flag.String("scenarios", "session,stream,hitl,fork,mcp,shared,concurrency", "perf: scenarios to run")
 	flag.Parse()
 	if flag.NArg() == 0 {
-		fail("usage: probe [-addr host:port] [-agent name] stream|hitl|fork|isolation")
+		fail("usage: probe [-addr host:port] [-agent name] stream|hitl|fork|isolation|bench|perf|cleanup")
 	}
 	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	check(err)
-	ctx, cancel := context.WithTimeout(metadata.AppendToOutgoingContext(context.Background(), "x-user-id", "probe"), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(metadata.AppendToOutgoingContext(context.Background(), "x-user-id", "probe"), *timeout)
 	defer cancel()
 	c := &client{
 		ctx: ctx, a2a: a2apb.NewA2AServiceClient(conn), sessions: apiv1alpha1.NewSessionServiceClient(conn),
@@ -64,6 +73,20 @@ func main() {
 		c.fork(*agent)
 	case "isolation":
 		c.isolation(*agent)
+	case "perf":
+		cfg := perfConfig{agent: *agent, hitlAgent: *hitlAgent, mcpAgent: *mcpAgent, sharedAgent: *sharedAgent, n: *n, settle: *settle, scenarios: map[string]bool{}}
+		for _, name := range strings.Split(*scenarios, ",") {
+			cfg.scenarios[strings.TrimSpace(name)] = true
+		}
+		for _, level := range strings.Split(*levels, ",") {
+			var v int
+			if _, err := fmt.Sscanf(strings.TrimSpace(level), "%d", &v); err == nil && v > 0 {
+				cfg.concurrency = append(cfg.concurrency, v)
+			}
+		}
+		c.perf(cfg)
+	case "sandboxperf":
+		sandboxPerf(*cli, *apiURL, *template, *n)
 	case "cleanup":
 		c.cleanup(*agent)
 	case "bench":
