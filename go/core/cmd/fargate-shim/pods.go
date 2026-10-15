@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
@@ -55,6 +56,8 @@ type startRequest struct {
 type podInfo struct {
 	ref     ref
 	warmKey string
+	// actor is the actor the pod is annotated for; empty for an unclaimed warm pod.
+	actor   ref
 	created time.Time
 }
 
@@ -131,7 +134,10 @@ func (p *k8sPods) List(ctx context.Context) ([]podInfo, error) {
 	}
 	var out []podInfo
 	for _, pod := range list.Items {
-		out = append(out, podInfo{ref: ref{pod.Namespace, pod.Name}, warmKey: pod.Labels[warmKeyLabel], created: pod.CreationTimestamp.Time})
+		out = append(out, podInfo{
+			ref: ref{pod.Namespace, pod.Name}, warmKey: pod.Labels[warmKeyLabel], created: pod.CreationTimestamp.Time,
+			actor: ref{pod.Annotations[actorAtespaceAnno], pod.Annotations[actorNameAnno]},
+		})
 	}
 	return out, nil
 }
@@ -145,6 +151,23 @@ func (p *k8sPods) Hint(template *ateapipb.ActorTemplate) {
 func (p *k8sPods) Maintain(ctx context.Context) {
 	if p.warm != nil {
 		p.warm.maintain(ctx, p)
+		return
+	}
+	p.removeWarmPods(ctx)
+}
+
+// removeWarmPods deletes the idle warm pods a previous configuration left behind once
+// the pool is turned off. A claimed pod has lost its warm label, so it is not touched.
+func (p *k8sPods) removeWarmPods(ctx context.Context) {
+	infos, err := p.List(ctx)
+	if err != nil {
+		return
+	}
+	for _, info := range infos {
+		if info.warmKey != "" {
+			slog.Info("deleting warm pod, the pool is off", "pod", info.ref.String())
+			_ = p.Delete(ctx, info.ref.atespace, info.ref.name)
+		}
 	}
 }
 

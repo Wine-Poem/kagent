@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -42,18 +43,79 @@ type warmEntry struct {
 // the container start instead of the microVM start. A pod serves one actor and is
 // never reused. Pools are keyed by everything that shapes the pod except its env,
 // so agents that share a runtime image share a pool.
+//
+// Claims run in parallel: mu only guards the choice of a pod (the reserved set), and
+// the probe, relabel and activation calls happen outside it. A burst of sessions
+// therefore waits for one activation, not for the sum of all of them.
 type warmPool struct {
 	size    int
 	idleTTL time.Duration
 	now     func() time.Time
 	mu      sync.Mutex
 	entries map[string]*warmEntry
-	claimMu sync.Mutex
-	images  sync.Map
+	// reserved holds the warm pods whose claim is in flight, keyed by namespace/name.
+	reserved map[string]bool
+	images   sync.Map
 }
 
 func newWarmPool(size int, idleTTL time.Duration) *warmPool {
-	return &warmPool{size: size, idleTTL: idleTTL, now: time.Now, entries: map[string]*warmEntry{}}
+	return &warmPool{size: size, idleTTL: idleTTL, now: time.Now, entries: map[string]*warmEntry{}, reserved: map[string]bool{}}
+}
+
+func podKey(pod *corev1.Pod) string { return pod.Namespace + "/" + pod.Name }
+
+// reserve marks a warm pod as being claimed; it reports false when another claim got it first.
+func (w *warmPool) reserve(pod *corev1.Pod) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.reserved[podKey(pod)] {
+		return false
+	}
+	w.reserved[podKey(pod)] = true
+	return true
+}
+
+func (w *warmPool) release(pod *corev1.Pod) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.reserved, podKey(pod))
+}
+
+func (w *warmPool) isReserved(pod *corev1.Pod) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.reserved[podKey(pod)]
+}
+
+// surplusWarmPods picks which idle pods to delete when a pool holds more than size,
+// for example after --warm-pool was lowered. Pods that are not ready yet go first,
+// then the newest, so the pods most likely to serve the next claim stay. Pods with a
+// claim in flight are never picked.
+func surplusWarmPods(live []corev1.Pod, size int, reserved func(*corev1.Pod) bool) []corev1.Pod {
+	if size < 0 {
+		size = 0
+	}
+	excess := len(live) - size
+	if excess <= 0 {
+		return nil
+	}
+	candidates := make([]corev1.Pod, 0, len(live))
+	for _, pod := range live {
+		if !reserved(&pod) {
+			candidates = append(candidates, pod)
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		ri, rj := candidates[i].Status.Phase == corev1.PodRunning, candidates[j].Status.Phase == corev1.PodRunning
+		if ri != rj {
+			return !ri
+		}
+		return candidates[j].CreationTimestamp.Before(&candidates[i].CreationTimestamp)
+	})
+	if excess > len(candidates) {
+		excess = len(candidates)
+	}
+	return candidates[:excess]
 }
 
 func specKey(template *ateapipb.ActorTemplate, settings podSettings) string {
@@ -132,7 +194,14 @@ func (w *warmPool) maintain(ctx context.Context, p *k8sPods) {
 			w.mu.Unlock()
 			continue
 		}
-		if len(live) >= w.size {
+		if len(live) > w.size {
+			for _, pod := range surplusWarmPods(live, w.size, w.isReserved) {
+				slog.Info("deleting surplus warm pod", "pod", podKey(&pod), "size", w.size)
+				_ = p.Delete(ctx, namespace, pod.Name)
+			}
+			continue
+		}
+		if len(live) == w.size {
 			continue
 		}
 		if err := p.ensureTrustBundle(ctx, namespace); err != nil {
@@ -185,7 +254,8 @@ func randSuffix() string {
 }
 
 // claim hands an idle warm pod to the actor. It reports false when no pod is ready,
-// and the caller then starts a cold pod.
+// and the caller then starts a cold pod. Concurrent claims each reserve a different
+// pod and do their network calls in parallel (see warmPool).
 func (w *warmPool) claim(ctx context.Context, p *k8sPods, req startRequest) (string, bool) {
 	template := req.Template
 	if len(template.GetContainers()) != 1 {
@@ -194,39 +264,59 @@ func (w *warmPool) claim(ctx context.Context, p *k8sPods, req startRequest) (str
 	key := specKey(template, p.settings)
 	w.touch(template, p.settings)
 	namespace := req.Actor.GetMetadata().GetAtespace()
-	w.claimMu.Lock()
-	defer w.claimMu.Unlock()
 	pods, err := w.liveWarmPods(ctx, p, namespace, key)
 	if err != nil {
 		return "", false
 	}
-	for _, pod := range pods {
-		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || !wrapperWaiting(ctx, pod.Status.PodIP) {
+	var act *activation
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || !w.reserve(pod) {
 			continue
 		}
-		act, err := w.activationFor(ctx, req)
-		if err != nil {
-			slog.Warn("build activation", "error", err)
-			return "", false
+		if act == nil {
+			built, err := w.activationFor(ctx, req)
+			if err != nil {
+				w.release(pod)
+				slog.Warn("build activation", "error", err)
+				return "", false
+			}
+			act = &built
 		}
-		patch, _ := json.Marshal(map[string]any{"metadata": map[string]any{
-			"labels": map[string]any{warmKeyLabel: nil},
-			"annotations": map[string]string{
-				actorNameAnno: req.Actor.GetMetadata().GetName(), actorAtespaceAnno: namespace, actorUIDAnno: req.Actor.GetMetadata().GetUid(),
-			},
-		}})
-		if _, err := p.client.CoreV1().Pods(namespace).Patch(ctx, pod.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
-			continue
+		claimed := w.activate(ctx, p, req, pod, *act)
+		w.release(pod)
+		if claimed {
+			slog.Info("claimed warm pod", "pod", pod.Name, "actor", req.Actor.GetMetadata().GetName())
+			return pod.Name, true
 		}
-		if err := postActivation(ctx, pod.Status.PodIP, act); err != nil {
-			slog.Warn("activate warm pod", "pod", pod.Name, "error", err)
-			_ = p.Delete(ctx, namespace, pod.Name)
-			continue
-		}
-		slog.Info("claimed warm pod", "pod", pod.Name, "actor", req.Actor.GetMetadata().GetName())
-		return pod.Name, true
 	}
 	return "", false
+}
+
+// activate turns one reserved warm pod into the actor's pod. Removing the warm label is
+// the claim itself; the patch carries the pod's resourceVersion, so a pod that changed
+// since it was listed (for example another shim replica claimed it) is skipped.
+func (w *warmPool) activate(ctx context.Context, p *k8sPods, req startRequest, pod *corev1.Pod, act activation) bool {
+	if !wrapperWaiting(ctx, pod.Status.PodIP) {
+		return false
+	}
+	meta := req.Actor.GetMetadata()
+	patch, _ := json.Marshal(map[string]any{"metadata": map[string]any{
+		"resourceVersion": pod.ResourceVersion,
+		"labels":          map[string]any{warmKeyLabel: nil},
+		"annotations": map[string]string{
+			actorNameAnno: meta.GetName(), actorAtespaceAnno: meta.GetAtespace(), actorUIDAnno: meta.GetUid(),
+		},
+	}})
+	if _, err := p.client.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		return false
+	}
+	if err := postActivation(ctx, pod.Status.PodIP, act); err != nil {
+		slog.Warn("activate warm pod", "pod", pod.Name, "error", err)
+		_ = p.Delete(ctx, pod.Namespace, pod.Name)
+		return false
+	}
+	return true
 }
 
 func (w *warmPool) activationFor(ctx context.Context, req startRequest) (activation, error) {

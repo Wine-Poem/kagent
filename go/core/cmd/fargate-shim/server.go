@@ -61,6 +61,9 @@ type actorRecord struct {
 	podName string
 	// startMu serializes pod starts per actor, so an eager start and a resume cannot claim two warm pods.
 	startMu sync.Mutex
+	// starting is true while a pod start is in flight. A claimed warm pod loses its warm
+	// label before podName points at it, so the reaper must not take it for an orphan.
+	starting bool
 }
 
 func (r *actorRecord) pod() string {
@@ -421,7 +424,13 @@ func (s *server) startPod(ctx context.Context, key ref, run bool) error {
 	defer rec.startMu.Unlock()
 	s.mu.Lock()
 	podName := rec.pod()
+	rec.starting = true
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		rec.starting = false
+		s.mu.Unlock()
+	}()
 	if state, err := s.pods.State(ctx, key.atespace, podName); err == nil && state.Exists {
 		return nil
 	}
@@ -561,24 +570,29 @@ func (s *server) viewLocked(ctx context.Context, rec *actorRecord) *ateapipb.Act
 // reap deletes pods of suspended actors after the grace period and pods without an actor.
 // Warm pods belong to the pool, which manages them.
 func (s *server) reap(ctx context.Context) {
-	s.mu.Lock()
-	var expired []ref
-	inUse := map[ref]bool{}
-	for key, rec := range s.actors {
-		pod := ref{key.atespace, rec.pod()}
-		inUse[pod] = true
-		if rec.wanted == ateapipb.ActorState_ACTOR_STATE_SUSPENDED && s.now().Sub(rec.suspendedAt) >= s.cfg.SuspendGrace {
-			expired = append(expired, pod)
-		}
-	}
-	s.mu.Unlock()
 	managed, err := s.pods.List(ctx)
 	if err != nil {
 		slog.Warn("list managed pods", "error", err)
 		return
 	}
+	// Read the records after listing: a claim that finished in between then counts as in use.
+	s.mu.Lock()
+	var expired []ref
+	inUse := map[ref]bool{}
+	starting := map[ref]bool{}
+	for key, rec := range s.actors {
+		pod := ref{key.atespace, rec.pod()}
+		inUse[pod] = true
+		if rec.starting {
+			starting[key] = true
+		}
+		if rec.wanted == ateapipb.ActorState_ACTOR_STATE_SUSPENDED && s.now().Sub(rec.suspendedAt) >= s.cfg.SuspendGrace {
+			expired = append(expired, pod)
+		}
+	}
+	s.mu.Unlock()
 	for _, m := range managed {
-		if m.warmKey == "" && !inUse[m.ref] {
+		if m.warmKey == "" && !inUse[m.ref] && !starting[m.actor] {
 			expired = append(expired, m.ref)
 		}
 	}

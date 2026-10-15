@@ -6,12 +6,15 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -406,6 +409,43 @@ func TestReapKeepsWarmPodsAndClaimedPods(t *testing.T) {
 	}
 }
 
+// TestReapSparesAWarmPodWhileItsClaimIsInFlight covers the window in which a claimed warm
+// pod has lost its warm label but the actor record does not point at it yet.
+func TestReapSparesAWarmPodWhileItsClaimIsInFlight(t *testing.T) {
+	pods := &claimingPods{fakePods: newFakePods(true)}
+	s := newTestServer(t, pods)
+	createActor(t, s)
+	pods.pods[ref{"ns", "warm-abc-claim"}] = podState{Exists: true}
+	s.mu.Lock()
+	rec := s.actors[ref{"ns", "session-1"}]
+	rec.starting = true
+	s.mu.Unlock()
+	s.reap(context.Background())
+	if state, _ := pods.State(context.Background(), "ns", "warm-abc-claim"); !state.Exists {
+		t.Fatal("a pod being claimed for a known actor is not an orphan")
+	}
+	s.mu.Lock()
+	rec.starting = false
+	s.mu.Unlock()
+	s.reap(context.Background())
+	if state, _ := pods.State(context.Background(), "ns", "warm-abc-claim"); state.Exists {
+		t.Fatal("once no start is in flight, a pod the actor does not use is an orphan")
+	}
+}
+
+// claimingPods reports warm-abc-claim as annotated for session-1 without a warm label.
+type claimingPods struct{ *fakePods }
+
+func (c *claimingPods) List(ctx context.Context) ([]podInfo, error) {
+	infos, err := c.fakePods.List(ctx)
+	for i := range infos {
+		if infos[i].ref.name == "warm-abc-claim" {
+			infos[i].actor = ref{"ns", "session-1"}
+		}
+	}
+	return infos, err
+}
+
 type warmAwarePods struct{ *fakePods }
 
 func (w *warmAwarePods) List(context.Context) ([]podInfo, error) {
@@ -471,6 +511,152 @@ func TestMaintainTopsUpPoolsAndDropsStaleOnes(t *testing.T) {
 	}
 	if _, err := client.CoreV1().Pods("ns").Get(ctx, "warm-gone-bbbbb", metav1.GetOptions{}); err != nil {
 		t.Error("a young pod is left alone")
+	}
+}
+
+func warmPod(name, key string, phase corev1.PodPhase, created time.Time) corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "ns", CreationTimestamp: metav1.NewTime(created),
+			Labels: map[string]string{managedByLabel: managedByValue, warmKeyLabel: key},
+		},
+		Status: corev1.PodStatus{Phase: phase},
+	}
+}
+
+func TestSurplusWarmPodsPrefersUnreadyThenNewest(t *testing.T) {
+	now := time.Now()
+	live := []corev1.Pod{
+		warmPod("old-running", "k", corev1.PodRunning, now.Add(-3*time.Minute)),
+		warmPod("new-running", "k", corev1.PodRunning, now.Add(-time.Minute)),
+		warmPod("pending", "k", corev1.PodPending, now.Add(-2*time.Minute)),
+		warmPod("claiming", "k", corev1.PodRunning, now),
+	}
+	claiming := func(p *corev1.Pod) bool { return p.Name == "claiming" }
+	names := func(pods []corev1.Pod) []string {
+		var out []string
+		for _, p := range pods {
+			out = append(out, p.Name)
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		size int
+		want []string
+	}{
+		{size: 4, want: nil},
+		{size: 3, want: []string{"pending"}},
+		{size: 2, want: []string{"pending", "new-running"}},
+		{size: 0, want: []string{"pending", "new-running", "old-running"}},
+	} {
+		if got := names(surplusWarmPods(live, tc.size, claiming)); strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Errorf("size %d: deleted %v, want %v", tc.size, got, tc.want)
+		}
+	}
+}
+
+func TestMaintainDeletesSurplusWarmPods(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	pods := &k8sPods{client: client, settings: podSettings{CPU: "400m", Memory: "1Gi", HelperImage: "helper@sha256:1"}, warm: newWarmPool(1, time.Hour)}
+	template := testTemplate("ns", "tpl")
+	pods.Hint(template)
+	key := specKey(template, pods.settings)
+	ctx := context.Background()
+	for i, name := range []string{"warm-a", "warm-b", "warm-c"} {
+		pod := warmPod(name, key, corev1.PodRunning, time.Now().Add(time.Duration(i)*time.Second))
+		if _, err := client.CoreV1().Pods("ns").Create(ctx, &pod, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pods.Maintain(ctx)
+	list, _ := client.CoreV1().Pods("ns").List(ctx, metav1.ListOptions{LabelSelector: warmKeyLabel + "=" + key})
+	if len(list.Items) != 1 || list.Items[0].Name != "warm-a" {
+		t.Fatalf("lowering the pool to 1 keeps only the oldest ready pod, got %v", list.Items)
+	}
+}
+
+func TestMaintainWithThePoolOffRemovesOnlyIdleWarmPods(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	pods := &k8sPods{client: client}
+	ctx := context.Background()
+	idle := warmPod("warm-idle", "k", corev1.PodRunning, time.Now())
+	claimed := warmPod("warm-claimed", "", corev1.PodRunning, time.Now())
+	delete(claimed.Labels, warmKeyLabel)
+	for _, p := range []corev1.Pod{idle, claimed} {
+		if _, err := client.CoreV1().Pods("ns").Create(ctx, &p, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pods.Maintain(ctx)
+	if _, err := client.CoreV1().Pods("ns").Get(ctx, "warm-idle", metav1.GetOptions{}); err == nil {
+		t.Error("an idle warm pod is deleted once the pool is off")
+	}
+	if _, err := client.CoreV1().Pods("ns").Get(ctx, "warm-claimed", metav1.GetOptions{}); err != nil {
+		t.Error("a claimed pod belongs to its actor and stays")
+	}
+}
+
+// TestConcurrentClaimsActivateInParallel runs one fake wrapper per loopback address on
+// the wrapper port. Each activation takes 300ms; serial claims would take 1.2s for 4.
+func TestConcurrentClaimsActivateInParallel(t *testing.T) {
+	const n, delay = 4, 300 * time.Millisecond
+	client := fake.NewSimpleClientset()
+	pods := &k8sPods{client: client, settings: podSettings{CPU: "400m", Memory: "1Gi", HelperImage: "helper@sha256:1"}, warm: newWarmPool(n, time.Hour)}
+	template := testTemplate("ns", "tpl")
+	template.Containers[0].Command = []string{"/runtime"}
+	key := specKey(template, pods.settings)
+	ctx := context.Background()
+	activations := make([]int, n)
+	var mu sync.Mutex
+	for i := 0; i < n; i++ {
+		ip := fmt.Sprintf("127.0.0.%d", i+2)
+		ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", ip, wrapperPort))
+		if err != nil {
+			t.Skipf("cannot listen on %s:%d: %v", ip, wrapperPort, err)
+		}
+		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				time.Sleep(delay)
+				mu.Lock()
+				activations[i]++
+				mu.Unlock()
+			}
+		})}
+		go srv.Serve(ln)
+		t.Cleanup(func() { srv.Close() })
+		pod := warmPod(fmt.Sprintf("warm-%d", i), key, corev1.PodRunning, time.Now())
+		pod.Status.PodIP = ip
+		if _, err := client.CoreV1().Pods("ns").Create(ctx, &pod, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed := make([]string, n)
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			actor := &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Atespace: "ns", Name: fmt.Sprintf("session-%d", i), Uid: uuid.NewString()}}
+			claimed[i], _ = pods.warm.claim(ctx, pods, startRequest{Actor: actor, Template: template})
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	seen := map[string]bool{}
+	for i, name := range claimed {
+		if name == "" || seen[name] {
+			t.Fatalf("claim %d got %q; every claim needs its own pod: %v", i, name, claimed)
+		}
+		seen[name] = true
+	}
+	for i, count := range activations {
+		if count != 1 {
+			t.Errorf("wrapper %d was activated %d times", i, count)
+		}
+	}
+	if elapsed > 2*delay {
+		t.Errorf("%d claims took %v; they should overlap, not queue", n, elapsed)
 	}
 }
 

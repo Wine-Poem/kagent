@@ -61,6 +61,8 @@ func run() error {
 	snapshotURL := flag.String("snapshot-url", "", "base URL of the snapshot store; empty keeps /data only for the life of the pod")
 	snapshotSecretFile := flag.String("snapshot-secret-file", "/etc/ate-snapshot/secret", "secret shared with the snapshot store")
 	helperImage := flag.String("helper-image", os.Getenv("HELPER_IMAGE"), "image of this program, used by restore, snapshot and warm pods")
+	kubeQPS := flag.Float64("kube-qps", 50, "client-side rate limit for Kubernetes API calls; client-go's default of 5 serializes bursts of sessions")
+	kubeBurst := flag.Int("kube-burst", 100, "client-side burst for Kubernetes API calls")
 	flag.Parse()
 	if *namespace == "" {
 		return fmt.Errorf("--namespace or POD_NAMESPACE is required")
@@ -70,6 +72,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	restConfig.QPS, restConfig.Burst = float32(*kubeQPS), *kubeBurst
 	client, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return err
