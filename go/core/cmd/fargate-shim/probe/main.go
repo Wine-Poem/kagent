@@ -7,7 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
@@ -38,6 +40,9 @@ type session struct{ id, tenant string }
 func main() {
 	addr := flag.String("addr", "localhost:8083", "controller address")
 	agent := flag.String("agent", "echo-agent", "agent name")
+	n := flag.Int("n", 5, "bench: sessions in the sequential phase")
+	conc := flag.Int("c", 8, "bench: sessions in the concurrent phase")
+	settle := flag.Duration("settle", 8*time.Second, "bench: wait after the first message so the runtime can quiesce")
 	flag.Parse()
 	if flag.NArg() == 0 {
 		fail("usage: probe [-addr host:port] [-agent name] stream|hitl|fork|isolation")
@@ -59,6 +64,10 @@ func main() {
 		c.fork(*agent)
 	case "isolation":
 		c.isolation(*agent)
+	case "cleanup":
+		c.cleanup(*agent)
+	case "bench":
+		c.bench(*agent, *n, *conc, *settle)
 	default:
 		fail("unknown scenario " + flag.Arg(0))
 	}
@@ -255,4 +264,92 @@ func check(err error) {
 func fail(message string) {
 	fmt.Fprintln(os.Stderr, message)
 	os.Exit(1)
+}
+
+func report(name string, durations []time.Duration) {
+	if len(durations) == 0 {
+		return
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	fmt.Printf("BENCH %-34s n=%-2d min=%-8s median=%-8s max=%s\n", name, len(durations),
+		durations[0].Round(time.Millisecond), durations[len(durations)/2].Round(time.Millisecond), durations[len(durations)-1].Round(time.Millisecond))
+}
+
+// bench measures the latencies a user feels: creating a session, the first message right after it,
+// a message after the runtime had time to quiesce, and many sessions starting at once.
+func (c *client) bench(agent string, n, conc int, settle time.Duration) {
+	var create, first, later []time.Duration
+	for i := 0; i < n; i++ {
+		start := time.Now()
+		s := c.create(agent)
+		create = append(create, time.Since(start))
+		start = time.Now()
+		c.send(s, fmt.Sprintf("bench %d first message", i))
+		first = append(first, time.Since(start))
+		time.Sleep(settle)
+		start = time.Now()
+		c.send(s, fmt.Sprintf("bench %d message after %s", i, settle))
+		later = append(later, time.Since(start))
+	}
+	report("create session", create)
+	report("first message right after create", first)
+	report("message after the runtime quiesced", later)
+
+	type result struct{ total, firstMsg time.Duration }
+	results := make([]result, conc)
+	var wg sync.WaitGroup
+	wall := time.Now()
+	for i := 0; i < conc; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start := time.Now()
+			s := c.create(agent)
+			mid := time.Now()
+			c.send(s, fmt.Sprintf("concurrent %d", i))
+			results[i] = result{total: time.Since(start), firstMsg: time.Since(mid)}
+		}(i)
+	}
+	wg.Wait()
+	var totals, firsts []time.Duration
+	for _, r := range results {
+		totals = append(totals, r.total)
+		firsts = append(firsts, r.firstMsg)
+	}
+	report(fmt.Sprintf("concurrent x%d create+first message", conc), totals)
+	report(fmt.Sprintf("concurrent x%d first message only", conc), firsts)
+	fmt.Printf("BENCH concurrent x%d wall clock until all answered: %s\n", conc, time.Since(wall).Round(time.Millisecond))
+}
+
+// cleanup deletes the probe's own sessions of one agent, so a test leaves no actors behind.
+func (c *client) cleanup(agent string) {
+	deleted := 0
+	for {
+		resp, err := c.sessions.ListSessions(c.ctx, &apiv1alpha1.ListSessionsRequest{
+			Agent: &apiv1alpha1.ResourceReference{Namespace: "kagent", Name: agent}, Page: &apiv1alpha1.PageRequest{Limit: 100},
+		})
+		check(err)
+		if len(resp.GetSessions()) == 0 {
+			break
+		}
+		progress := false
+		for _, session := range resp.GetSessions() {
+			for deadline := time.Now().Add(time.Minute); time.Now().Before(deadline); {
+				_, err := c.sessions.DeleteSession(c.ctx, &apiv1alpha1.DeleteSessionRequest{SessionId: session.GetId()})
+				if status.Code(err) == codes.FailedPrecondition {
+					time.Sleep(time.Second)
+					continue
+				}
+				if err == nil || status.Code(err) == codes.NotFound {
+					deleted++
+					progress = true
+				}
+				break
+			}
+		}
+		if !progress {
+			break
+		}
+	}
+	fmt.Printf("deleted %d sessions of agent %s\n", deleted, agent)
 }

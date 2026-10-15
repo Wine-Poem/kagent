@@ -1,4 +1,7 @@
 providers: null
+global:
+  # Namespaced Roles instead of ClusterRoles; verified to be enough for sessions, forks and sandboxes.
+  watchNamespaces: [kagent]
 podLabels:
   compute-type: fargate
 config:
